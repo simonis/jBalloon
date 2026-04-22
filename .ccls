@@ -1,0 +1,5 @@
+%c -std=c17
+%cpp -std=c++17
+
+-I/share/software/Java/corretto-25/include
+-I/share/software/Java/corretto-25/include/linux
