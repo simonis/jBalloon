@@ -78,13 +78,14 @@ public class JBalloon {
                         info.getGcCause(),
                         gcInfo.getDuration()));
 
-                reinflateAll();
+                //reinflateAll();
             };
 
             ((NotificationEmitter) gcBean).addNotificationListener(listener, new NotificationFilter() {
                 @Override
                 public boolean isNotificationEnabled(Notification notification) {
-                    return notification.getType().equals(GarbageCollectionNotificationInfo.GARBAGE_COLLECTION_NOTIFICATION);
+                    return (nr_of_ballons > 0) &&
+                            notification.getType().equals(GarbageCollectionNotificationInfo.GARBAGE_COLLECTION_NOTIFICATION);
                 }
             }, null);
         }
@@ -128,8 +129,13 @@ public class JBalloon {
             logger.fine("<-=- Inflate (exceeded MAX_NR_OF_BALLOONS=" + MAX_NR_OF_BALLOONS + ")");
             return null;
         }
+        int regionSize = 1024*1024;
+        int objectHeader = 16;
+        int regionAligned = (size / regionSize) * regionSize - objectHeader;
+        // Let the array fully occupy a certain number of GC regions.
+        size = regionAligned;
         byte[] balloonArray = new byte[size];
-        //for (byte i = 0; i < 10; i++) balloonArray[i] = i; // Just for debugging
+        for (byte i = 0; i < 10; i++) balloonArray[i] = i; // Just for debugging
         Balloon balloon = inflateNative(balloonArray);
         if (balloon != null) {
             balloons.put(balloon, balloonArray);
