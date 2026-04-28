@@ -19,12 +19,14 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
-// The userfaultfd file descriptor
+// The userfaultfd file descriptor.
 static long uffd = -1;
-// The default page size
+// The default page size.
 static int PAGE_SIZE = -1;
 
-// This struct is only used to get heap size and base address out of libjvm.so
+static jlong OVERLAP_CHUNK = 1024 * 1024;
+
+// This struct is only used to get heap size and base address out of libjvm.so.
 struct VMStructEntry {
     const char* typeName;
     const char* fieldName;
@@ -33,20 +35,41 @@ struct VMStructEntry {
     uint64_t offset;
     void* address;
 };
+
 static jlong* heapBase = nullptr;
 static size_t heapSizeBytes = -1;
+
+static jboolean useCompressedClassPointers;
+static jboolean compactObjectHeadersVM;
+static jboolean useCompactObjectHeaders;
+static jint objectHeaderSize;
+
 static jlong mincoreHeapSize();
 static jlong rssHeapSize();
 
-// This has to be in sync with io.simonis.jballoon.JBalloon.Balloon::MAX_NR_OF_BALLOONS 
+// This struct is used to get markWord::{lock_bits, lock_shift, klass_shift} out of libjvm.so.
+struct VMLongConstantEntry {
+    const char* name;
+    uint64_t value;
+};
+static jlong markWordKlassShift = -1;
+static jlong markWordLockBits = -1;
+static jlong markWordLockShift = -1;
+static jlong fullGCForwardingShift = -1;
+static jlong fullGCForwardingLowBits = -1;
+
+// This has to be in sync with io.simonis.jballoon.JBalloon.Balloon::MAX_NR_OF_BALLOONS.
 static int MAX_NR_OF_BALLOONS = -1;
 struct Balloon {
   long id;
   jbyte* objAddr;
   jbyte* addr;
   jbyte* fwdAddr;
+  jlong overlapOffset;
+  jbyte* overlapAddr;
   jint len;
-  Balloon(jbyte* objAddr, jbyte* addr, jint len, long id) : objAddr(objAddr), addr(addr), len(len), id(id), fwdAddr(nullptr) {}
+  Balloon(jbyte* objAddr, jbyte* addr, jint len, long id) :
+    objAddr(objAddr), addr(addr), len(len), id(id), fwdAddr(nullptr), overlapOffset(0), overlapAddr(nullptr) {}
 };
 
 enum LogLevel {
@@ -99,6 +122,15 @@ static int log(LogLevel l, const char* format, ...) {
     return ret;
   }
   return 0;
+}
+
+void* forwardingPointer(jlong* oop) {
+  jlong mark = *oop;
+  if (compactObjectHeadersVM) {
+    return heapBase + ((mark & fullGCForwardingLowBits) >> fullGCForwardingShift);
+  } else {
+    return (void*)(mark & ~3LL); // Apply the lock mask, i.e. zero the two lower bits.
+  }
 }
 
 static jboolean userfaultfd_register(void* addr, size_t len) {
@@ -278,9 +310,7 @@ static void* userfaultfd_handler(void* arg) {
         continue;
       }
 
-      if (msg.arg.pagefault.flags & UFFD_PAGEFAULT_FLAG_WP) {
-        // We don't need this any more
-      } else {
+      if (msg.arg.pagefault.flags == 0 /* reading a missing page */) {
         if ((jbyte*)range.start == balloon->addr) {
           // The first page of the ballon. The first page fault should always happen in the 
           // first page of the balloon, because G1 GC compacts/copies humongous objects from
@@ -297,21 +327,66 @@ static void* userfaultfd_handler(void* arg) {
           // This highly depends on the configuration (i.e. GC, CompressedObjectHeader, CompressedClassPointers, etc.)
           // For G1 GC, we know that the forwarding pointers have been installed before humongous objects are
           // moved and humongous compaction only happens in a stop the world phase at a safepoint.
-          balloon->fwdAddr = (jbyte*)(heapBase + (*(jlong*)balloon->objAddr >> 2));
-          log(TRACE, "balloon at %p moves to %p\n", balloon->objAddr, balloon->fwdAddr);
-          // We page in all the pages which belong to the balloon except for the last one because
-          // we want to be notified when copying of the balloon is done (i.e. when the last page
-          // will be copied).
-          range.len = balloon->len - PAGE_SIZE;
+          //balloon->fwdAddr = (jbyte*)(heapBase + (*(jlong*)balloon->objAddr >> 2));
+          balloon->fwdAddr = (jbyte*)forwardingPointer((jlong*)balloon->objAddr);
+          jlong overlapOffset = balloon->objAddr - balloon->fwdAddr;
+          jlong overlap = balloon->len - overlapOffset;
+          log(TRACE, "balloon at %p moves to %p with %d bytes of overlap\n", balloon->objAddr, balloon->fwdAddr, overlap > 0 ? overlap : 0);
+          if (overlap > (OVERLAP_CHUNK + PAGE_SIZE)) {
+            // If there's an overlap between the old and the new location, this overlap region will be paged
+            // in when the object is moved, because we don't only read from this overlap area (when reading from
+            // the source location) but also write into it (when writing to the destination location). Reading
+            // from a MADV_DONTNEED page will only page in the system ZERO page, which doesn't consume any memory
+            // at all. But writing into a page which is backed up by the system ZERO page will allocate a real
+            // memory page, even if we only write zeros into that page (i.e. the kernel doesn't check what we write).
+            // This means that once we reach the read location in the source object which writes into the overlap
+            // are, we must consecutively MADV_DONTNEED the previously written pages, to ensure that the balloon
+            // maintains its size of un-allocated memory. We therefore only page in the pages up to this overlap
+            // location, such that we will be notified when we will have to start this process.
+            // To speed up things we handle the inflation of the overlap in bigger chunks.
+            size_t chunks = (overlap - PAGE_SIZE) / OVERLAP_CHUNK;
+            size_t remaining = (overlap - PAGE_SIZE) % OVERLAP_CHUNK;
+            range.len = overlapOffset + remaining;
+            // We also record the overlap address to ease processing the overlap range.
+            assert(balloon->overlapAddr == nullptr && balloon->overlapOffset == 0);
+            balloon->overlapAddr = balloon->addr + overlapOffset + remaining;
+            balloon->overlapOffset = overlapOffset;
+
+          } else {
+            // No overlap, so we can immediately page in all the pages which belong to the balloon except for the
+            // very last one because we still want to be notified when copying of the balloon is done (i.e. when the
+            // last page will be copied).
+            range.len = balloon->len - PAGE_SIZE;
+          }
           userfaultfd_zeropage(range);
-        } else if ((jbyte*)range.start == (balloon->addr + balloon->len - PAGE_SIZE) ) {
+        } else if ((jbyte*)range.start == balloon->overlapAddr) {
+          // We're in the overlap region.
+          log(INFO, "Pagefault at %p in the overlap region of balloon at %p\n", (void*)range.start, balloon->addr);
+          // Free the previous overlap page.
+          if (madvise(balloon->overlapAddr - balloon->overlapOffset - OVERLAP_CHUNK, OVERLAP_CHUNK, MADV_DONTNEED) != 0) {
+            warn("userfaultfd_handler::madv(MADV_DONTNEED, OVERLAP)");
+            return nullptr;
+          }
+          log(TRACE, "userfaultfd_handler::madvise(%p, %d, OVERLAP)\n", balloon->overlapAddr - balloon->overlapOffset - OVERLAP_CHUNK, OVERLAP_CHUNK);
+          // Zero page in the current chunk so we can continue to copy the object.
+          range.len = OVERLAP_CHUNK;
+          userfaultfd_zeropage(range);
+          // And update 'overlapAddr' until we reach the last page of the source object.
+          if ((balloon->overlapAddr + OVERLAP_CHUNK) < (balloon->addr + balloon->len - PAGE_SIZE)) {
+            balloon->overlapAddr += OVERLAP_CHUNK;
+          } else {
+            // We're done with the overlap area. Processing the last page of the source object will do the rest.
+            balloon->overlapOffset = 0;
+            balloon->overlapAddr = nullptr;
+          }
+        } else if ((jbyte*)range.start == (balloon->addr + balloon->len - PAGE_SIZE)) {
           // The last page of the balloon. This means that copying the balloon is about to finish.
           log(INFO, "Pagefault at %p in the last page of balloon at %p\n", (void*)range.start, balloon->addr);
           jbyte* oldAddr = balloon->addr; // We still need this for unregistering the old range from userfaultfd.
           // Update the balloon to the new location
           assert(balloon->fwdAddr != nullptr);
           balloon->objAddr = balloon->fwdAddr;
-          jbyte* bytes = balloon->fwdAddr + 16;
+          jbyte* bytes = balloon->fwdAddr + objectHeaderSize + 4 /* the integer length field */;
           balloon->addr = bytes + (PAGE_SIZE - ((jlong)bytes % PAGE_SIZE));
           balloon->fwdAddr = nullptr;
           // Inflate the balloon at the new location. We don't inflate the last page, otherwise we would
@@ -320,7 +395,7 @@ static void* userfaultfd_handler(void* arg) {
           // We actually dont inflate the last THREE pages, because glibc's optimized memmove() which is used in
           // HotSpot to move objects during GC can use prefetching and striping which might still write to the two
           // previous destination pages while reading from the last source page.
-          if (madvise(balloon->addr, balloon->len - (3*PAGE_SIZE) /*XXX*/, MADV_DONTNEED) != 0) {
+          if (madvise(balloon->addr, balloon->len - (3*PAGE_SIZE), MADV_DONTNEED) != 0) {
             warn("userfaultfd_handler::madv(MADV_DONTNEED, MOVED)");
             return nullptr;
           }
@@ -347,6 +422,12 @@ static void* userfaultfd_handler(void* arg) {
           userfaultfd_zeropage(range);
         }
         log(DEBUG, "Java Heap <- (reserved/mincore/RSS) = (%dkb / %dkb / %dkb)\n", heapSizeBytes/1024, mincoreHeapSize()/1024, rssHeapSize()/1024);
+      } else if (msg.arg.pagefault.flags & UFFD_PAGEFAULT_FLAG_WRITE) {
+        log(WARNING, "Pagefault UFFD_PAGEFAULT_FLAG_WRITE at %p (should not happen - probably due to optimized memmove()))\n", (void*)range.start);
+        range.len = PAGE_SIZE;
+        userfaultfd_zeropage(range);
+      } else {
+        log(WARNING, "Pagefault with flags %d at %p (should not happen))\n", msg.arg.pagefault.flags, (void*)range.start);
       }
     } else {
       log(WARNING, "Unexpected event %d on userfaultfd\n", msg.event);
@@ -356,7 +437,15 @@ static void* userfaultfd_handler(void* arg) {
 }
 
 extern "C"
-JNIEXPORT jboolean JNICALL Java_io_simonis_jballoon_JBalloon_nativeInit(JNIEnv* env, jclass clazz) {
+JNIEXPORT jboolean JNICALL Java_io_simonis_jballoon_JBalloon_nativeInit(JNIEnv* env, jclass clazz,
+                                                                        jboolean _useCompressedOops, jboolean _useCompressedClassPointers,
+                                                                        jboolean _compactObjectHeadersVM, jboolean _useCompactObjectHeaders,
+                                                                        jint _objectHeaderSize, jstring _gc, jlong _regionSize) {
+
+  useCompressedClassPointers = _useCompressedClassPointers;
+  compactObjectHeadersVM = _compactObjectHeadersVM;
+  useCompactObjectHeaders = _useCompactObjectHeaders;
+  objectHeaderSize = _objectHeaderSize;
 
   jballoonCls = env->FindClass("io/simonis/jballoon/JBalloon");
   jballoonCls = (jclass)env->NewGlobalRef(jballoonCls);
@@ -404,7 +493,7 @@ JNIEXPORT jboolean JNICALL Java_io_simonis_jballoon_JBalloon_nativeInit(JNIEnv* 
 
   struct uffdio_api uffdio_api;
   uffdio_api.api = UFFD_API;
-  uffdio_api.features = UFFD_FEATURE_EXACT_ADDRESS | UFFD_FEATURE_PAGEFAULT_FLAG_WP | UFFD_FEATURE_THREAD_ID;
+  uffdio_api.features = UFFD_FEATURE_EXACT_ADDRESS | UFFD_FEATURE_THREAD_ID;
   if (ioctl(uffd, UFFDIO_API, &uffdio_api) == -1) {
     warn("ioctl(UFFDIO_API, 0)");
     return false;
@@ -412,9 +501,6 @@ JNIEXPORT jboolean JNICALL Java_io_simonis_jballoon_JBalloon_nativeInit(JNIEnv* 
   log(INFO, "userfaultfd supported features = %llx\n", uffdio_api.features);
   if (uffdio_api.features & UFFD_FEATURE_EXACT_ADDRESS) {
     log(INFO, "userfaultfd supports UFFD_FEATURE_EXACT_ADDRESS, using it\n");
-  }
-  if (uffdio_api.features & UFFD_FEATURE_PAGEFAULT_FLAG_WP) {
-    log(INFO, "userfaultfd supports UFFD_FEATURE_PAGEFAULT_FLAG_WP, using it\n");
   }
   if (uffdio_api.features & UFFD_FEATURE_THREAD_ID) {
     log(INFO, "userfaultfd supports UFFD_FEATURE_THREAD_ID, using it\n");
@@ -477,7 +563,31 @@ JNIEXPORT jboolean JNICALL Java_io_simonis_jballoon_JBalloon_nativeInit(JNIEnv* 
                   (void*)collectedHeapAddr, reservedFieldOffset, baseFieldOffset, sizeFieldOffset);
         }
       } else {
-        warn("dlsym()");
+        warn("dlsym(gHotSpotVMStructs)");
+      }
+      VMLongConstantEntry* vmc = *(VMLongConstantEntry**)dlsym(handle, "gHotSpotVMLongConstants");
+      if (vmc) {
+        for (VMLongConstantEntry* entry = vmc; entry->name != nullptr; entry++) {
+          //log(TRACE, ">>> %s, %d\n", entry->name, entry->value);
+          if (strcmp(entry->name, "markWord::klass_shift") == 0) markWordKlassShift = entry->value;
+          if (strcmp(entry->name, "markWord::lock_bits") == 0) markWordLockBits = entry->value;
+          if (strcmp(entry->name, "markWord::lock_shift") == 0) markWordLockShift = entry->value;
+        }
+        if (markWordKlassShift != -1 && markWordLockBits != -1 && markWordLockShift != -1) {
+          log(INFO, "markWord::klass_shift: %d, markWord::lock_bits: %d, markWord::lock_shift: %d\n",
+            markWordKlassShift, markWordLockBits, markWordLockShift);
+            fullGCForwardingShift = markWordLockBits + markWordLockShift;
+            if (useCompactObjectHeaders) {
+              fullGCForwardingLowBits = (1LL << markWordKlassShift) - 1;
+            } else {
+              fullGCForwardingLowBits = -1;
+            }
+        } else {
+          log(WARNING, "Can't get vmStructs for markWord::klass_shift: %d, markWord::lock_bits: %d, markWord::lock_shift: %d\n",
+            markWordKlassShift, markWordLockBits, markWordLockShift);
+        }
+      } else {
+        warn("dlsym(gHotSpotVMIntConstants)");
       }
   } else {
     warn("dlopen()");
@@ -513,12 +623,8 @@ JNIEXPORT jobject JNICALL Java_io_simonis_jballoon_JBalloon_inflateNative(JNIEnv
   userfaultfd_register(addr, len);
   env->ReleasePrimitiveArrayCritical(array, bytes, 0);
 
-  // This is only correct for '-XX:+UseCompressedClassPointers in which case a Java byte[] looks as follows:
-  // 00 00 00 00  00 00 00 00    00 00 00 00  00 00 00 00   00 00 00 00 ...
-  //                Mark Word      Klass Ptr   arr.length   array elements
-  //
-  // GetPrimitiveArrayCritical() returns a pointer to the array elements
-  Balloon* balloonC = new_balloon(bytes - 16, addr, len);
+  // GetPrimitiveArrayCritical() returns a pointer to the array elements, but we want the actual oject address.
+  Balloon* balloonC = new_balloon(bytes - (objectHeaderSize + 4 /* the integer length field */), addr, len);
   if (balloonC == nullptr) {
     log(TRACE, "Should never happen (Can't create native Balloon object)\n");
   }
@@ -619,7 +725,8 @@ static jlong mincoreHeapSize() {
   return Java_io_simonis_jballoon_JBalloon_mincoreHeapSize(nullptr, 0);
 }
 
-static jlong rssHeapSize() {
+extern "C"
+JNIEXPORT jlong JNICALL Java_io_simonis_jballoon_JBalloon_rssHeapSize(JNIEnv* env, jclass clazz) {
     size_t num_pages = heapSizeBytes / PAGE_SIZE;
     uint64_t counts = 0;
 
@@ -643,8 +750,8 @@ static jlong rssHeapSize() {
         // Bits 0-54 contain the Page Frame Number (PFN). This requires CAP_SYS_ADMIN privileges.
         uint64_t pfn = entry & 0x7FFFFFFFFFFFFFULL;
         // The exclusive bit is a good alternative for distinguishing zero pages from other pages in memory
-        // because the zero page is almost for sure also used ini other processes on the system (so it is not exclusive)
-        // and all the other pages in an anonymous, private mapping like the Java heap are not shared by design.
+        // because the zero page is almost for sure also used in other processes on the system (so it is not exclusive)
+        // and all the other Java heap pages are in an anonymous, private mapping and are not shared by design.
         // And this solution doesn't require any elevated capabilities.
         int exclusive = (entry >> 56) & 1;
 
@@ -656,6 +763,10 @@ static jlong rssHeapSize() {
 
     close(fd);
     return counts * PAGE_SIZE;
+}
+
+static jlong rssHeapSize() {
+  return Java_io_simonis_jballoon_JBalloon_rssHeapSize(nullptr, 0);
 }
 
 extern "C"

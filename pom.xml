@@ -64,7 +64,7 @@
                                     <arg value="${project.basedir}/src/main/c/jballoon.cpp"/>
                                 </exec>
                                 <exec executable="gcc" failonerror="true">
-                                    <arg value="-g"/>
+                                    <arg value="-O2"/>
                                     <arg value="-shared"/>
                                     <arg value="-fPIC"/>
                                     <arg value="-o"/>

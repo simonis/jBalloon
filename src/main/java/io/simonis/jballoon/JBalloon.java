@@ -1,23 +1,15 @@
 package io.simonis.jballoon;
 
-import com.sun.management.GarbageCollectionNotificationInfo;
-import com.sun.management.GcInfo;
+import com.sun.management.HotSpotDiagnosticMXBean;
+import com.sun.management.VMOption;
 
-import javax.management.Notification;
-import javax.management.NotificationEmitter;
-import javax.management.NotificationFilter;
-import javax.management.NotificationListener;
-import java.io.ByteArrayOutputStream;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.PrintStream;
-import java.lang.management.GarbageCollectorMXBean;
 import java.lang.management.ManagementFactory;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
-import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Handler;
 import java.util.logging.Level;
@@ -31,7 +23,56 @@ public class JBalloon {
 
     private static final Logger logger = Logger.getLogger(JBalloon.class.getName());
 
-    private static native boolean nativeInit();
+    private static boolean useCompressedOops;
+    private static boolean useCompressedClassPointers;
+    private static boolean compactObjectHeadersVM;
+    private static boolean useCompactObjectHeaders;
+    private static int objectHeaderSize;
+    private static String gc;
+    private static long regionSize;
+
+    private static native boolean nativeInit(boolean useCompressedOops, boolean useCompressedClassPointers,
+                                             boolean compactObjectHeadersVM, boolean useCompactObjectHeaders,
+                                             int objectHeaderSize, String gc, long regionSize);
+
+    private static void initJvmArgs() {
+        HotSpotDiagnosticMXBean hsDiagnosticBean = ManagementFactory.getPlatformMXBean(HotSpotDiagnosticMXBean.class);
+        VMOption option = hsDiagnosticBean.getVMOption("UseCompressedOops");
+        useCompressedOops = Boolean.parseBoolean(option.getValue());
+        option = hsDiagnosticBean.getVMOption("UseCompressedClassPointers");
+        useCompressedClassPointers = Boolean.parseBoolean(option.getValue());
+        try {
+            option = hsDiagnosticBean.getVMOption("UseCompactObjectHeaders");
+            compactObjectHeadersVM = true;
+            useCompactObjectHeaders = Boolean.parseBoolean(option.getValue());
+        } catch (IllegalArgumentException iae) {
+            compactObjectHeadersVM = false;
+            useCompactObjectHeaders = false;
+        }
+        option = hsDiagnosticBean.getVMOption("UseG1GC");
+        if (Boolean.parseBoolean(option.getValue())) {
+            gc = "G1";
+            option = hsDiagnosticBean.getVMOption("G1HeapRegionSize");
+            regionSize = Long.parseLong(option.getValue());
+        } else {
+            option = hsDiagnosticBean.getVMOption("UseShenandoahGC");
+            if (Boolean.parseBoolean(option.getValue())) {
+                gc = "Shenandoah";
+                option = hsDiagnosticBean.getVMOption("ShenandoahRegionSize");
+                regionSize = Long.parseLong(option.getValue());
+            } else {
+                option = hsDiagnosticBean.getVMOption("UseParallelGC");
+                if (Boolean.parseBoolean(option.getValue())) {
+                    gc = "Parallel";
+                    regionSize = 1024 * 1024; // Not really the region size..
+                } else {
+                    gc = null; // Unsupported GC
+                }
+            }
+        }
+        objectHeaderSize = useCompactObjectHeaders ? 8 :
+                useCompressedClassPointers ? 12 : 16;
+    }
 
     private static void init() {
         // %1=Date, %2=Source, %3=Logger, %4=Level, %5=Messagejni, %6=Throwable
@@ -43,6 +84,7 @@ public class JBalloon {
         for (Handler h : root.getHandlers()) {
             h.setLevel(logLevel);
         }
+        initJvmArgs();
         String libName = "/native/libjballoon.so";
         try {
             Path temp = Files.createTempFile("libjballoon", ".so");
@@ -55,7 +97,9 @@ public class JBalloon {
         } catch (IOException ioe) {
             logger.log(Level.SEVERE, "Can't load: " + libName, ioe);
         }
-        if (nativeInit()) {
+        if (nativeInit(useCompressedOops, useCompressedClassPointers,
+                       compactObjectHeadersVM, useCompactObjectHeaders,
+                       objectHeaderSize, gc, regionSize)) {
             jBalloon = new JBalloon();
         }
     }
@@ -65,31 +109,6 @@ public class JBalloon {
     }
 
     private JBalloon() {
-        List<GarbageCollectorMXBean> gcBeans = ManagementFactory.getGarbageCollectorMXBeans();
-
-        for (GarbageCollectorMXBean gcBean : gcBeans) {
-            NotificationListener listener = (notification, handback) -> {
-                GarbageCollectionNotificationInfo info = GarbageCollectionNotificationInfo.from(
-                        (javax.management.openmbean.CompositeData) notification.getUserData());
-                GcInfo gcInfo = info.getGcInfo();
-                logger.info(String.format("[%s] %s (Cause: %s) Duration: %d ms",
-                        info.getGcName(),
-                        info.getGcAction(),
-                        info.getGcCause(),
-                        gcInfo.getDuration()));
-
-                //reinflateAll();
-            };
-
-            ((NotificationEmitter) gcBean).addNotificationListener(listener, new NotificationFilter() {
-                @Override
-                public boolean isNotificationEnabled(Notification notification) {
-                    return (nr_of_ballons > 0) &&
-                            notification.getType().equals(GarbageCollectionNotificationInfo.GARBAGE_COLLECTION_NOTIFICATION);
-                }
-            }, null);
-        }
-
     }
 
     public static JBalloon getInstance() {
@@ -167,23 +186,11 @@ public class JBalloon {
         balloons.forEach((b, o) -> deflate(b));
     }
 
-    private static native Balloon reinflateNative(Balloon b, byte[] array);
-
-    public synchronized void reinflateAll() {
-        logger.fine("===> reinflateAll ");
-        balloons.forEach((b, array) -> {
-            logger.fine("Reinflating " + b);
-            reinflateNative(b, array);
-            logger.fine("Reinflated " + b);
-        });
-        logger.fine("<=== reinflateAll ");
-
-    }
-
     public synchronized long size() {
         return balloons.keySet().stream().mapToLong(Balloon::size).sum();
     }
 
     public static native long heapSize();
-    public static native long committedHeapSize();
+    public static native long mincoreHeapSize();
+    public static native long rssHeapSize();
 }

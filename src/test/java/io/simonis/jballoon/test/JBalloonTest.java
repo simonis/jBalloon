@@ -23,8 +23,9 @@ public class JBalloonTest {
     }
 
     private static void printRSS(String msg) {
-        System.out.println("RSS (" + msg + ") = " + getRSS() + "kb, Java Heap (reserved/committed) = (" +
-                (JBalloon.heapSize() / 1024) + "kb / " + (JBalloon.committedHeapSize() / 1024) + "kb)");
+        System.out.println("RSS (" + msg + ") = " + getRSS() + "kb, Java Heap (reserved/mincore/RSS) = (" +
+                (JBalloon.heapSize() / 1024) + "kb / " + (JBalloon.mincoreHeapSize() / 1024) + "kb / " +
+                (JBalloon.rssHeapSize() / 1024) + "kb)");
     }
 
     private static void allocate(int bytes) {
