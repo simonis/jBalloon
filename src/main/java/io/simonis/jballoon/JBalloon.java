@@ -30,8 +30,9 @@ public class JBalloon {
     private static int objectHeaderSize;
     private static String gc;
     private static long regionSize;
+    private static int javaVersion = Runtime.version().feature();
 
-    private static native boolean nativeInit(boolean useCompressedOops, boolean useCompressedClassPointers,
+    private static native boolean nativeInit(int javaVersion, boolean useCompressedOops, boolean useCompressedClassPointers,
                                              boolean compactObjectHeadersVM, boolean useCompactObjectHeaders,
                                              int objectHeaderSize, String gc, long regionSize);
 
@@ -58,8 +59,18 @@ public class JBalloon {
             option = hsDiagnosticBean.getVMOption("UseShenandoahGC");
             if (Boolean.parseBoolean(option.getValue())) {
                 gc = "Shenandoah";
-                option = hsDiagnosticBean.getVMOption("ShenandoahRegionSize");
-                regionSize = Long.parseLong(option.getValue());
+                // Unfortunately, ShenandoahRegionSize is an experimental option and only
+                // availabe through the HotSpotDiagnosticMXBean if experimental options
+                // were enabled on the command line.
+                option = hsDiagnosticBean.getVMOption("UnlockExperimentalVMOptions");
+                if (Boolean.parseBoolean(option.getValue())) {
+                    option = hsDiagnosticBean.getVMOption("ShenandoahRegionSize");
+                    regionSize = Long.parseLong(option.getValue());
+                } else {
+                    // ToDo: use sun.management.Flag::getVMOption() reflectively
+                    // or vmStructs/JVMFlag::flags[] in native code
+                    regionSize = 1024 * 1024;
+                }
             } else {
                 option = hsDiagnosticBean.getVMOption("UseParallelGC");
                 if (Boolean.parseBoolean(option.getValue())) {
@@ -97,7 +108,7 @@ public class JBalloon {
         } catch (IOException ioe) {
             logger.log(Level.SEVERE, "Can't load: " + libName, ioe);
         }
-        if (nativeInit(useCompressedOops, useCompressedClassPointers,
+        if (nativeInit(javaVersion, useCompressedOops, useCompressedClassPointers,
                        compactObjectHeadersVM, useCompactObjectHeaders,
                        objectHeaderSize, gc, regionSize)) {
             jBalloon = new JBalloon();
@@ -148,9 +159,16 @@ public class JBalloon {
             logger.fine("<-=- Inflate (exceeded MAX_NR_OF_BALLOONS=" + MAX_NR_OF_BALLOONS + ")");
             return null;
         }
-        int regionSize = 1024*1024;
-        int objectHeader = 16;
-        int regionAligned = (size / regionSize) * regionSize - objectHeader;
+        if (size < regionSize) {
+            logger.fine("<-=- Inflate (ballon must contain at least regionSize=" + regionSize + " bytes)");
+            return null;
+        }
+        int byteArrayOffset = objectHeaderSize + 4 /* the integer length field*/;
+        if (javaVersion < 23) {
+            // Need to align to 8 bytes (see https://bugs.openjdk.org/browse/JDK-8314882).
+            byteArrayOffset = ((byteArrayOffset + 4) / 8) * 8;
+        }
+        int regionAligned = (size / (int)regionSize) * (int)regionSize - byteArrayOffset;
         // Let the array fully occupy a certain number of GC regions.
         size = regionAligned;
         byte[] balloonArray = new byte[size];

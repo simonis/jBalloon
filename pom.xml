@@ -54,7 +54,7 @@
                             <target>
                                 <mkdir dir="${project.build.outputDirectory}/native"/>
                                 <exec executable="g++" failonerror="true">
-                                    <arg value="-g"/>
+                                    <arg value="-O2"/>
                                     <arg value="-shared"/>
                                     <arg value="-fPIC"/>
                                     <arg value="-I${java.home}/include"/>

@@ -38,8 +38,8 @@ public class HumongousFragmentationTest {
             objects.add(newObj);
             sink = new Object();
 
-            if (c == count / 10) {
-                JBalloon.Balloon balloon = jBalloon.inflate(1024*1024*32);
+            if (c == count / 10 && jBalloon != null) {
+                JBalloon.Balloon balloon = jBalloon.inflate(Integer.getInteger("balloonSize", 32*1024*1024));
             }
 
             System.out.println("Allocated: " + (current / 1024 / 1024) + " Mb");
