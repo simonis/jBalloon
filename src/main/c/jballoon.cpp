@@ -625,12 +625,12 @@ JNIEXPORT jobject JNICALL Java_io_simonis_jballoon_JBalloon_inflateNative(JNIEnv
   jboolean isCopy;
   jint len = env->GetArrayLength(array);
   if (len < 3 * PAGE_SIZE) {
-    log(WARNING, "Can't inflate balloon because length (%d) is smaller than 3*PAGE_SIZE (%d).\n", len, 3*PAGE_SIZE);
+    log(WARNING, "inflateNative::Can't inflate balloon because length (%d) is smaller than 3*PAGE_SIZE (%d).\n", len, 3*PAGE_SIZE);
     return nullptr;
   }
   jbyte* bytes = (jbyte*)env->GetPrimitiveArrayCritical(array, &isCopy);
   if (isCopy) {
-    log(WARNING, "Can't inflate balloon because GetPrimitiveArrayCritical returns a copy.\n");
+    log(WARNING, "inflateNative::Can't inflate balloon because GetPrimitiveArrayCritical returns a copy.\n");
     return nullptr;
   }
   long offset = (PAGE_SIZE - ((uintptr_t)bytes % PAGE_SIZE));
@@ -639,7 +639,7 @@ JNIEXPORT jobject JNICALL Java_io_simonis_jballoon_JBalloon_inflateNative(JNIEnv
   // from left to right and this might confuse our bookkeeping. 
   len = ((len - offset - PAGE_SIZE/* XXX */) / PAGE_SIZE) * PAGE_SIZE;
   if (madvise(addr, len, MADV_DONTNEED) != 0) {
-    warn("madv(MADV_DONTNEED)");
+    warn("inflateNative::madv(MADV_DONTNEED)");
     env->ReleasePrimitiveArrayCritical(array, bytes, 0);
     return nullptr;
   }
@@ -648,71 +648,37 @@ JNIEXPORT jobject JNICALL Java_io_simonis_jballoon_JBalloon_inflateNative(JNIEnv
   env->ReleasePrimitiveArrayCritical(array, bytes, 0);
 
   // GetPrimitiveArrayCritical() returns a pointer to the array elements, but we want the actual oject address.
-  Balloon* balloonC = new_balloon(bytes - byteArrayOffset, addr, len);
-  if (balloonC == nullptr) {
-    log(DEBUG, "Should never happen (Can't create native Balloon object)\n");
+  Balloon* balloon = new_balloon(bytes - byteArrayOffset, addr, len);
+  if (balloon == nullptr) {
+    log(WARNING, "inflateNative::Should never happen (Can't create native Balloon object at %p)\n", addr);
+  } else {
+    log(DEBUG, "inflateNative::Created balloon at %p with id %d.\n", addr, balloon->id);
   }
-  jobject balloon = env->NewObject(balloonCls, balloonCstr, addr, len, balloonC->id);
-  return balloon;
+  jobject jballoon = env->NewObject(balloonCls, balloonCstr, addr, len, balloon->id);
+  return jballoon;
 }
 
 extern "C"
-JNIEXPORT void JNICALL Java_io_simonis_jballoon_JBalloon_removeNative(JNIEnv* env, jclass clazz, jobject balloon, jbyteArray array) {
-  jlong address = env->GetLongField(balloon, balloonAddressFd);
-  jint length = env->GetIntField(balloon, balloonSizeFd);
-  jlong id = env->GetLongField(balloon, balloonIdFd);
-  Balloon* balloonC = find_balloon((jbyte*)address, id);
-  if (balloonC != nullptr) {
-    remove_balloon(balloonC);
+JNIEXPORT void JNICALL Java_io_simonis_jballoon_JBalloon_removeNative(JNIEnv* env, jclass clazz, jobject jballoon, jbyteArray array) {
+  jboolean isCopy;
+  jbyte* bytes = (jbyte*)env->GetPrimitiveArrayCritical(array, &isCopy);
+  if (isCopy) {
+    log(WARNING, "Can't inflate balloon because GetPrimitiveArrayCritical returns a copy.\n");
   }
-}
-
-extern "C"
-JNIEXPORT jobject JNICALL Java_io_simonis_jballoon_JBalloon_reinflateNative(JNIEnv* env, jclass clazz, jobject balloon, jbyteArray array) {
-  jlong originalAddr = env->GetLongField(balloon, balloonAddressFd);
-  jint originalLen = env->GetIntField(balloon, balloonSizeFd);
-  jlong id = env->GetLongField(balloon, balloonIdFd);
-  Balloon* balloonC = find_balloon((jbyte*)originalAddr, id);
-  if (balloonC != nullptr) {
-    jboolean isCopy;
-    jint len = env->GetArrayLength(array);
-    if (len < 2 * PAGE_SIZE) {
-      log(ERROR, "Can't reinflate balloon because length (%d) is smaller than 2*PAGE_SIZE (%d).\n", len, 2*PAGE_SIZE);
-      return nullptr;
-    }
-    jbyte* bytes = (jbyte*)env->GetPrimitiveArrayCritical(array, &isCopy);
-    if (isCopy) {
-      log(ERROR, "Can't reinflate balloon because GetPrimitiveArrayCritical returns a copy.\n");
-      return nullptr;
-    }
-    long offset = (PAGE_SIZE - ((uintptr_t)bytes % PAGE_SIZE));
-    jbyte* addr = bytes + offset;
-    len = ((len - offset) / PAGE_SIZE) * PAGE_SIZE;
-    // If the original balloon was moved by GC
-    if ((jbyte*)originalAddr != addr) {
-      // Inflate the balloon in the new location
-      if (madvise(addr, len, MADV_DONTNEED) != 0) {
-        warn("madvise(MADV_DONTNEED)");
-        env->ReleasePrimitiveArrayCritical(array, bytes, 0);
-        return nullptr;
-      }
-      log(DEBUG, "reinflateNative::madvise(%p, %d)\n", addr, len);
-      // Register the new location with userfaultfd
-      userfaultfd_register(addr, len);
-      // And update the location in both, the Java..
-      env->SetLongField(balloon, balloonAddressFd, (jlong)addr);
-      env->SetIntField(balloon, balloonSizeFd, len);
-      // ..and the C balloon structure
-      balloonC->addr = addr;
-      balloonC->len = len;
+  long offset = (PAGE_SIZE - ((uintptr_t)bytes % PAGE_SIZE));
+  jbyte* addr = bytes + offset;
+  jlong id = env->GetLongField(jballoon, balloonIdFd);
+  Balloon* balloon = find_balloon(addr, id);
+  if (balloon != nullptr) {
+    if (remove_balloon(balloon)) {
+      log(DEBUG, "removeNative::Removed balloon at %p with id %d.\n", addr, id);
     } else {
-      log(DEBUG, "No need to reinflate because balloon at address %p didn't move.\n", (jbyte*)originalAddr);
+      log(WARNING, "removeNative::Can't remove balloon at %p with id %d.\n", addr, id);
     }
-    env->ReleasePrimitiveArrayCritical(array, bytes, 0);
-    return balloon;
+  } else {
+    log(WARNING, "removeNative::Can't find balloon at %p with id %d.\n", addr, id);
   }
-  log(WARNING, "Can't reinflate because no balloon found at original address %p.\n", (jbyte*)originalAddr);
-  return nullptr;
+  env->ReleasePrimitiveArrayCritical(array, bytes, 0);
 }
 
 unsigned char* return_vec = nullptr;

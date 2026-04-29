@@ -24,6 +24,11 @@ public class HumongousFragmentationTest {
         objects = new ArrayList<>();
         long current = 0;
         JBalloon jBalloon = JBalloon.getInstance();
+        JBalloon.Balloon balloon = null;
+
+        System.out.println("Java Heap => (reserved/mincore/RSS) = (" +
+                (JBalloon.heapSize() / 1024) + "kb / " + (JBalloon.mincoreHeapSize() / 1024) + "kb / " +
+                (JBalloon.rssHeapSize() / 1024) + "kb)");
 
         Random rng = new Random(Integer.getInteger("seed", 42));
         for (long c = 0; c < count; c++) {
@@ -39,10 +44,16 @@ public class HumongousFragmentationTest {
             sink = new Object();
 
             if (c == count / 10 && jBalloon != null) {
-                JBalloon.Balloon balloon = jBalloon.inflate(Integer.getInteger("balloonSize", 32*1024*1024));
+                balloon = jBalloon.inflate(Integer.getInteger("balloonSize", 32*1024*1024));
+            }
+            if (c == count - (count / 10) && jBalloon != null) {
+                jBalloon.deflate(balloon);
             }
 
             System.out.println("Allocated: " + (current / 1024 / 1024) + " Mb");
         }
+        System.out.println("Java Heap <= (reserved/mincore/RSS) = (" +
+                (JBalloon.heapSize() / 1024) + "kb / " + (JBalloon.mincoreHeapSize() / 1024) + "kb / " +
+                (JBalloon.rssHeapSize() / 1024) + "kb)");
     }
 }
