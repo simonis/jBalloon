@@ -46,7 +46,7 @@ public class HumongousFragmentationTest {
             if (c == count / 10 && jBalloon != null) {
                 balloon = jBalloon.inflate(Integer.getInteger("balloonSize", 32*1024*1024));
             }
-            if (c == count - (count / 10) && jBalloon != null) {
+            if (c == count - (count / 10) && balloon != null) {
                 jBalloon.deflate(balloon);
             }
 
