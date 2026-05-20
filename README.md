@@ -124,3 +124,9 @@ Ideally, it should be possible to use the manageable [`-XX:SoftMaxHeapSize`](htt
 
 Currently, most GCs treat the maximum configured heap size as a "free" resource which they eagerly consume (similar to the [Linux Page Cache](https://github.com/firmianay/Life-long-Learner/blob/master/linux-kernel-development/chapter-16.md)). but there's currently some activity to make the Java heap sizing more dynamic and let it adapt to e.g. the system load or the GC times. Among these are [JDK-8236073: G1: Use SoftMaxHeapSize to guide GC heuristics
 ](https://bugs.openjdk.org/browse/JDK-8236073), [JDK-8359211: Automatic Heap Sizing for G1](https://bugs.openjdk.org/browse/JDK-8359211) and [JDK-8377305: Automatic Heap Sizing for ZGC](https://bugs.openjdk.org/browse/JDK-8377305). And finally there's Google's [No More Xmx - Adaptable Heap Sizing for Containerized Java Applications](https://www.youtube.com/watch?v=qOt4vOkk49k) approach, which was presented at Devoxx Belgium in 2022.
+
+Finally, making this a JDK-supported feature would considerably simplify the implementation and make it more robust a the same time. This could be achieved by making `jBalloon` a JDK class similar to e.g. `WeakReference` which is known to and specially handled by the GC. In such a case, there would be no need for the usage of the [`userfaultfd`](https://docs.kernel.org/6.3/admin-guide/mm/userfaultfd.html) functionality and the reinflation in the event of movement could be trivially handled directly by the GC.
+
+## ToDo
+ - Shenadoah support
+ - TransparentHugePages/LargePage support
