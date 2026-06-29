@@ -14,15 +14,21 @@ void *memmove(void *dest, const void *src, size_t n) {
 
     int pages = n / PAGE_SIZE;
     int remaining = n % PAGE_SIZE;
-    for (size_t i = 0; i < pages; i++) {
-        original_memmove(dest + (i * PAGE_SIZE), src + (i * PAGE_SIZE), PAGE_SIZE);
+    if (dest < src) {
+        for (size_t i = 0; i < pages; i++) {
+            original_memmove(dest + (i * PAGE_SIZE), src + (i * PAGE_SIZE), PAGE_SIZE);
+        }
+    } else {
+        for (size_t i = pages; i > 0; i--) {
+            original_memmove(dest + ((i - 1) * PAGE_SIZE), src + ((i - 1) * PAGE_SIZE), PAGE_SIZE);
+        }
     }
 
     unsigned char *d = dest + pages * PAGE_SIZE;
     const unsigned char *s = src + pages * PAGE_SIZE;
 
     if (d < s) {
-       for (size_t i = 0; i < remaining; i++) {
+        for (size_t i = 0; i < remaining; i++) {
             d[i] = s[i];
         }
     } else {
