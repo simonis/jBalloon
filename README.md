@@ -128,5 +128,5 @@ Currently, most GCs treat the maximum configured heap size as a "free" resource 
 Finally, making this a JDK-supported feature would considerably simplify the implementation and make it more robust a the same time. This could be achieved by making `jBalloon` a JDK class similar to e.g. `WeakReference` which is known to and specially handled by the GC. In such a case, there would be no need for the usage of the [`userfaultfd`](https://docs.kernel.org/6.3/admin-guide/mm/userfaultfd.html) functionality and the reinflation in the event of movement could be trivially handled directly by the GC.
 
 ## ToDo
- - Shenadoah support
+ - Shenadoah support (Shenandoah can move humongous objects to higher addresses, i.e. the top of the heap)
  - TransparentHugePages/LargePage support

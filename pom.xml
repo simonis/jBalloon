@@ -54,7 +54,7 @@
                             <target>
                                 <mkdir dir="${project.build.outputDirectory}/native"/>
                                 <exec executable="g++" failonerror="true">
-                                    <arg value="-O2"/>
+                                    <arg value="-g"/>
                                     <arg value="-shared"/>
                                     <arg value="-fPIC"/>
                                     <arg value="-I${java.home}/include"/>
@@ -64,7 +64,7 @@
                                     <arg value="${project.basedir}/src/main/c/jballoon.cpp"/>
                                 </exec>
                                 <exec executable="gcc" failonerror="true">
-                                    <arg value="-O2"/>
+                                    <arg value="-g"/>
                                     <arg value="-shared"/>
                                     <arg value="-fPIC"/>
                                     <arg value="-o"/>

@@ -1,10 +1,15 @@
 #include <jni.h>
 
+#ifndef _GNU_SOURCE
+  #define _GNU_SOURCE
+#endif
 #include <assert.h>
 #include <dlfcn.h>
+#include <elf.h>
 #include <err.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <link.h>
 #include <linux/userfaultfd.h>
 #include <poll.h>
 #include <pthread.h>
@@ -22,7 +27,7 @@
 // The userfaultfd file descriptor.
 static long uffd = -1;
 // The default page size.
-static int PAGE_SIZE = -1;
+static size_t PAGE_SIZE = -1;
 
 static jlong OVERLAP_CHUNK = 1024 * 1024;
 
@@ -36,6 +41,11 @@ struct VMStructEntry {
     void* address;
 };
 
+// base address of libjballoon.so
+static char* jBalloonBase = nullptr;
+// base address of libjvm.so
+static char* libJvmBase = nullptr;
+
 static jlong* heapBase = nullptr;
 static size_t heapSizeBytes = -1;
 
@@ -45,6 +55,7 @@ static jboolean useCompressedClassPointers;
 static jboolean compactObjectHeadersVM;
 static jboolean useCompactObjectHeaders;
 static jint objectHeaderSize;
+static jlong regionSize; // Currently only implemented for G1 GC
 // The offset of the actual byte array relative to the "[b" objects start address.
 static jint byteArrayOffset;
 
@@ -136,7 +147,188 @@ static int log(LogLevel l, const char* format, ...) {
   return 0;
 }
 
-void* forwardingPointer(jlong* oop) {
+// This function takes a handle to a loaded shared library and the name of an undefined
+// function in that shared library and returns the GOT (Global Offset Table) entry
+// (i.e. the absolute address of the entry) for that undefined function.
+static uintptr_t get_got_address(void* dl_handle, const char* fun_name) {
+  struct link_map* map = nullptr;
+  if (dlinfo(dl_handle, RTLD_DI_LINKMAP, &map) != 0) return 0;
+
+  Elf64_Sym* symtab = nullptr;   // ELF symbol table
+  char* strtab = nullptr;        // ELF string table
+  Elf64_Rela* jmprel = nullptr;  // ELF relocation entries for the procedure linkage table (PLT)
+  size_t plt_rel_size = 0;    // ELF size of the relocation entries for the PLT
+
+  for (Elf64_Dyn* dyn = map->l_ld; dyn->d_tag != DT_NULL; dyn++) {
+    switch (dyn->d_tag) {
+      case DT_SYMTAB:   symtab = (Elf64_Sym*)dyn->d_un.d_ptr; break;
+      case DT_STRTAB:   strtab = (char*)dyn->d_un.d_ptr; break;
+      case DT_JMPREL:   jmprel = (Elf64_Rela*)dyn->d_un.d_ptr; break;
+      case DT_PLTRELSZ: plt_rel_size = dyn->d_un.d_val; break;
+    }
+  }
+
+  if (!symtab || !strtab || !jmprel || plt_rel_size == 0) return 0;
+
+  size_t rel_count = plt_rel_size / sizeof(Elf64_Rela);
+  for (size_t i = 0; i < rel_count; i++) {
+    Elf64_Rela* rel = &jmprel[i];
+    uint32_t sym_index = ELF64_R_SYM(rel->r_info);
+    if (strcmp(&strtab[symtab[sym_index].st_name], fun_name) == 0) {
+      return (uintptr_t)(map->l_addr + rel->r_offset);
+    }
+  }
+  return 0;
+}
+
+// Helper function to return the address of a local (i.e. un-exported) symbol from a shared library.
+// If the the symbol was found and the third argument 'function_size' is not nullptr, it will contain
+// the size of the symbol (i.e. the function size for a function symbol) on return.
+static void* find_local_symbol(void* dl_handle, const char* symbol_name, size_t* function_size) {
+  struct link_map* map = nullptr;
+
+  // Retrieve internal linker information to get the absolute file path of the .so
+  if (dlinfo(dl_handle, RTLD_DI_LINKMAP, &map) != 0 || !map->l_name) {
+    return nullptr;
+  }
+
+  // Open the shared library file directly
+  int fd = open(map->l_name, O_RDONLY);
+  if (fd < 0) {
+    return nullptr;
+  }
+
+  // Get the file size to map the entire binary into memory for rapid parsing
+  off_t size = lseek(fd, 0, SEEK_END);
+  char* file_base = (char*)mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+  close(fd); // File descriptor can be closed safely right after mmap
+
+  if (file_base == MAP_FAILED) {
+    return nullptr;
+  }
+
+  // Map ELF header and section headers from the file raw data
+  Elf64_Ehdr* ehdr = (Elf64_Ehdr*)file_base;
+  Elf64_Shdr* shdr = (Elf64_Shdr*)(file_base + ehdr->e_shoff);
+
+  // Get the section header string table to resolve section names (.symtab, .strtab, etc.)
+  char* shstrtab = file_base + shdr[ehdr->e_shstrndx].sh_offset;
+
+  Elf64_Sym* symtab = nullptr;
+  char* strtab = nullptr;
+  size_t sym_count = 0;
+
+  // Iterate through all section headers to locate .symtab and .strtab
+  for (int i = 0; i < ehdr->e_shnum; i++) {
+    const char* sec_name = shstrtab + shdr[i].sh_name;
+
+    if (strcmp(sec_name, ".symtab") == 0) {
+      // Found the regular symbol table (not loaded into RAM by the OS)
+      symtab = (Elf64_Sym*)(file_base + shdr[i].sh_offset);
+      sym_count = shdr[i].sh_size / sizeof(Elf64_Sym);
+    } else if (strcmp(sec_name, ".strtab") == 0) {
+      // Found the corresponding string table for local symbol names
+      strtab = file_base + shdr[i].sh_offset;
+    }
+  }
+
+  void* result_addr = nullptr;
+
+  // Search the symbol table for the requested local function name
+  if (symtab && strtab) {
+    for (size_t i = 0; i < sym_count; i++) {
+      const char* current_name = strtab + symtab[i].st_name;
+
+      if (strcmp(current_name, symbol_name) == 0) {
+        // Runtime Address = RAM Base Address of the library + static file offset
+        result_addr = (void*)(map->l_addr + symtab[i].st_value);
+        // Read the exact function length in bytes from the ELF symbol metadata
+        if (function_size != nullptr) {
+          *function_size = (size_t)symtab[i].st_size;
+        }
+        break;
+      }
+    }
+  }
+
+  // Clean up the manual memory mapping
+  munmap(file_base, size);
+  return result_addr;
+}
+
+// Helper function to check if a specific memory address falls into any executable segment of a shared library
+static bool is_address_in_executable_segment(void* dl_handle, uintptr_t target_addr) {
+  struct link_map* map = nullptr;
+  if (dlinfo(dl_handle, RTLD_DI_LINKMAP, &map) != 0) {
+    return false;
+  }
+
+  // Locate the ELF Executive Header at the base address of the library
+  Elf64_Ehdr* ehdr = (Elf64_Ehdr*)map->l_addr;
+
+  // Find the Program Header Table using the offset from the ELF header
+  Elf64_Phdr* phdr_table = (Elf64_Phdr*)(map->l_addr + ehdr->e_phoff);
+
+  // Iterate through all program headers to inspect mapped memory segments
+  for (Elf64_Half i = 0; i < ehdr->e_phnum; i++) {
+    Elf64_Phdr* phdr = &phdr_table[i];
+
+    // We only care about loadable segments (PT_LOAD) that have executable permissions (PF_X)
+    if (phdr->p_type == PT_LOAD && (phdr->p_flags & PF_X)) {
+      // Calculate the absolute start and end address of this executable segment in RAM
+      uintptr_t segment_start = map->l_addr + phdr->p_vaddr;
+      uintptr_t segment_end = segment_start + phdr->p_memsz;
+
+      // Check if our target address is within the boundaries of this executable area
+      if (target_addr >= segment_start && target_addr < segment_end) {
+        return true; // Address is safe to read
+      }
+    }
+  }
+
+  return false; // Address is outside of any executable segment
+}
+
+// Checks if a CALL instruction ('0xe8' on x86) in a shared library calls the
+// function 'fun_name' (which is external to that library) through the
+// procedure linkage table (PLT) and the GOT (Global Offset Table).
+//
+// TODO: this code currently only works for x86_64, port it to aarch64 as well!
+static bool verify_is_got_func_call(void* dl_handle, uintptr_t call_addr, const char* fun_name) {
+  // On x86, a call is '0x8e' plus a 32-bit (i.e. four bytes) offset.
+  int32_t relative_offset;
+  memcpy(&relative_offset, (void*)(call_addr + 1), 4);
+
+  // If the target of the call is a function which is external to the shared library
+  // then 'relative_offset' is an instruction pointer relative offset based on the address
+  // after the CALL instruction which points to a procedure linkage table (PLT) entry.
+  uintptr_t plt_entry_addr = call_addr + 5 /* CALL instruction size on x64_64 */ + relative_offset;
+
+  // Make sure the potential address is inside an executable segment of 'dl_handle'
+  if (!is_address_in_executable_segment(dl_handle, plt_entry_addr)) {
+    return false; // Not a valid, IP-relative call
+  }
+  // If the call target is indeed a PLT entry it should contain an instruction pointer
+  // relative JMP instruction (i.e. "jmp *offset(%rip)") of the form:
+  // '0xff 0x25' plus a 32-bit (i.e. four bytes) offset.
+  uint8_t* plt_code = (uint8_t*)plt_entry_addr;
+  if (plt_code[0] != 0xFF || plt_code[1] != 0x25) {
+    return false; // This doesn't seem to be a IP-relative JMP instruction
+  }
+
+  // Get the IP-relative offset for the JMP instruction (bytes 2 to 5 on x86_64)
+  memcpy(&relative_offset, &plt_code[2], 4);
+
+  // Compute the absolute address of the JMP target in the GOT (Global Offset Table).
+  uintptr_t got_entry_addr = plt_entry_addr + 6 /* JMP instruction ssize on x86_64 */ + relative_offset;
+
+  // Now also get the GOT entry address for 'fun_name'.
+  uintptr_t fun_got_entry_addr = get_got_address(dl_handle, fun_name);
+
+  return (fun_got_entry_addr != 0 && got_entry_addr == fun_got_entry_addr);
+}
+
+static void* forwardingPointer(jlong* oop) {
   jlong mark = *oop;
   if (compactObjectHeadersVM) {
     return heapBase + ((mark & fullGCForwardingLowBits) >> fullGCForwardingShift);
@@ -335,7 +527,7 @@ static void* userfaultfd_handler(void* arg) {
             return nullptr;
           }
           log(DEBUG, "userfaultfd_handler::madvise(%p, %d, LAST_PAGE)\n", balloon->addr + balloon->len - (3*PAGE_SIZE), 3*PAGE_SIZE);
-          // Extract the forwarding pointer from balloon->objAddr to compute the balloon address at the new location. 
+          // Extract the forwarding pointer from balloon->objAddr to compute the balloon address at the new location.
           // This highly depends on the configuration (i.e. GC, CompressedObjectHeader, CompressedClassPointers, etc.)
           // For G1 GC, we know that the forwarding pointers have been installed before humongous objects are
           // moved and humongous compaction only happens in a stop the world phase at a safepoint.
@@ -447,6 +639,44 @@ static void* userfaultfd_handler(void* arg) {
   return nullptr;
 }
 
+// This is jBallons's replacement for the transitive call to 'memmove()' in
+// 'G1FullGCCompactTask::compact_humongous_obj()' which is reached through the
+// call chain: 'copy_object_to_new_locatio()' -> 'Copy::aligned_conjoint_words()'
+// -> 'pd_aligned_conjoint_words()' -> 'pd_conjoint_words()' -> 'memmove()'.
+extern "C" void* jBallon_memmove(void* dest, const void* src, size_t n) {
+  // Balloon object are always humongous, so we can do this first, cheap check.
+  if (n >= regionSize / 2) {
+    // Now check if it is really a jBalloon object.
+    Balloon* balloon = nullptr;
+    for (int i = 0; i < MAX_NR_OF_BALLOONS; i++) {
+      if (balloons[i] != nullptr && balloons[i]->objAddr == src) {
+        balloon = balloons[i];
+        break;
+      }
+    }
+    if (balloon != nullptr) {
+      LOG(TRACE, "Java Heap -> (reserved/mincore/RSS) = (%dkb / %dkb / %dkb)\n", heapSizeBytes/1024, mincoreHeapSize()/1024, rssHeapSize()/1024);
+      // Only copy the object header
+      memmove(dest, src, 16);
+      // madvise the balloon at the new location
+      size_t offset = balloon->addr - balloon->objAddr;
+      if (madvise((char*)dest + offset, balloon->len, MADV_DONTNEED) != 0) {
+        warn("jBallon_memmove::madv(MADV_DONTNEED)");
+      }
+      log(DEBUG, "jBallon_memmove::madvise(%p, %d)\n", (char*)dest + offset, balloon->len);
+      // And update the Balloon data with the new location
+      balloon->objAddr = (jbyte*)dest;
+      balloon->addr = (jbyte*)dest + offset;
+      LOG(TRACE, "Java Heap -> (reserved/mincore/RSS) = (%dkb / %dkb / %dkb)\n", heapSizeBytes/1024, mincoreHeapSize()/1024, rssHeapSize()/1024);
+
+      return dest;
+    }
+    // Fallthrough
+  }
+
+  return memmove(dest, src, n);
+}
+
 extern "C"
 JNIEXPORT jboolean JNICALL Java_io_simonis_jballoon_JBalloon_nativeInit(JNIEnv* env, jclass clazz, jint _javaVersion,
                                                                         jboolean _useCompressedOops, jboolean _useCompressedClassPointers,
@@ -464,6 +694,7 @@ JNIEXPORT jboolean JNICALL Java_io_simonis_jballoon_JBalloon_nativeInit(JNIEnv* 
   compactObjectHeadersVM = _compactObjectHeadersVM;
   useCompactObjectHeaders = _useCompactObjectHeaders;
   objectHeaderSize = _objectHeaderSize;
+  regionSize = _regionSize;
   javaVersion = _javaVersion;
   byteArrayOffset = objectHeaderSize + 4 /* the integer length field*/;
   if (javaVersion < 23) {
@@ -509,6 +740,113 @@ JNIEXPORT jboolean JNICALL Java_io_simonis_jballoon_JBalloon_nativeInit(JNIEnv* 
   jfieldID pageSizeField = env->GetStaticFieldID(balloonCls, "PAGE_SIZE", "I");
   env->SetStaticIntField(balloonCls, pageSizeField, PAGE_SIZE);
 
+  bool use_jBallon_memmove = false;
+
+  Dl_info dl_info;
+  if (dladdr((void*)jBallon_memmove, &dl_info) != 0) {
+    jBalloonBase = (char*)dl_info.dli_fbase;
+    log(INFO, "jballoon.so loaded at %p\n", jBalloonBase);
+  } else {
+    warn("Can't get base address of jballoon.so");
+  }
+
+  void* libjvm_handle = dlopen("libjvm.so", RTLD_NOLOAD | RTLD_LAZY);
+  if (libjvm_handle == nullptr) {
+    log(ERROR, "libjvm.so must be loaded at this point.\n");
+    return false;
+  }
+
+  // Locate 'G1FullGCCompactTask::compact_humongous_obj(HeapRegion*)' in libjvm.so and get its size
+  size_t compact_humongous_obj_size = 0;
+  const char* copy_object_to_new_location_name = "_ZN19G1FullGCCompactTask27copy_object_to_new_locationEP7oopDesc";
+  const char* compact_humongous_obj_name = "_ZN19G1FullGCCompactTask21compact_humongous_objEP10HeapRegion";
+  if (javaVersion > 21) {
+    // 'HeapRegion' was renamed to 'G1HeapRegion' in JDK 2X
+    compact_humongous_obj_name = "_ZN19G1FullGCCompactTask21compact_humongous_objEP12G1HeapRegion";
+  }
+  char* compact_humongous_obj_addr = (char*)find_local_symbol(libjvm_handle, compact_humongous_obj_name, &compact_humongous_obj_size);
+  if (compact_humongous_obj_addr != nullptr) {
+    log(INFO, "Located 'G1FullGCCompactTask::compact_humongous_obj(HeapRegion*)' at %p\n", compact_humongous_obj_addr);
+    if (compact_humongous_obj_size != 0) {
+      log(INFO, "Size of 'G1FullGCCompactTask::compact_humongous_obj(HeapRegion*)' is %d\n", compact_humongous_obj_size);
+      uintptr_t patch_addr = 0;
+      // Now try to find a call to 'memmove()' in 'G1FullGCCompactTask::compact_humongous_obj()'
+      for (char* start = compact_humongous_obj_addr; start < compact_humongous_obj_addr + compact_humongous_obj_size; start++) {
+        if (*start == (char)0xe8 && verify_is_got_func_call(libjvm_handle, (uintptr_t)start, "memmove")) {
+          patch_addr = (uintptr_t)(start + 1);
+          break;
+        }
+      }
+      // If we didn't find the call to 'memmove()' in 'G1FullGCCompactTask::compact_humongous_obj()' it can be that
+      // 'G1FullGCCompactTask::compact_humongous_obj()' didn't inline ''G1FullGCCompactTask::copy_object_to_new_location()'.
+      // So check if we can find a call to 'G1FullGCCompactTask::copy_object_to_new_location()' in
+      // 'G1FullGCCompactTask::compact_humongous_obj()' and if that's the case, look for the 'memmove()' call in
+      // 'G1FullGCCompactTask::copy_object_to_new_location()'.
+      if (patch_addr == 0) {
+        size_t copy_object_to_new_location_size = 0;
+        char* copy_object_to_new_location_addr = (char*)find_local_symbol(libjvm_handle,
+                                                                          copy_object_to_new_location_name,
+                                                                          &copy_object_to_new_location_size);
+        if (copy_object_to_new_location_addr != nullptr && copy_object_to_new_location_size != 0) {
+          log(INFO, "Located 'G1FullGCCompactTask::copy_object_to_new_location(oop obj)' at %p\n", copy_object_to_new_location_addr);
+          log(INFO, "Size of 'G1FullGCCompactTask::copy_object_to_new_location(oop obj)' is %d\n", copy_object_to_new_location_size);
+          // Now try to find a call to 'G1FullGCCompactTask::copy_object_to_new_location()' in 'G1FullGCCompactTask::compact_humongous_obj()'.
+          for (char* start = compact_humongous_obj_addr; start < compact_humongous_obj_addr + compact_humongous_obj_size; start++) {
+            if (*start == (char)0xe8) {
+              int32_t relative_offset;
+              memcpy(&relative_offset, (void*)(start + 1), 4);
+              if (start + 5 + relative_offset == copy_object_to_new_location_addr) {
+                // 'G1FullGCCompactTask::compact_humongous_obj()' calls 'G1FullGCCompactTask::copy_object_to_new_location()'
+                // so we can find the call to 'memmove()' in 'G1FullGCCompactTask::copy_object_to_new_location()' and patch it there.
+                log(INFO, "'G1FullGCCompactTask::compact_humongous_obj()' calls 'copy_object_to_new_location()' at %p\n", start);
+
+                // Now try to find a call to 'memmove()' in 'G1FullGCCompactTask::compact_humongous_obj()'
+                for (char* s = copy_object_to_new_location_addr; s < copy_object_to_new_location_addr + copy_object_to_new_location_size; s++) {
+                  if (*s == (char)0xe8 && verify_is_got_func_call(libjvm_handle, (uintptr_t)s, "memmove")) {
+                    patch_addr = (uintptr_t)(s + 1);
+                    break;
+                  }
+                }
+                break;
+              }
+            }
+          }
+        } else {
+          if (copy_object_to_new_location_addr != nullptr) {
+            warn("Can't get address of 'G1FullGCCompactTask::copy_object_to_new_location(oop obj)' in libjvm.so (dlerror=%s)", dlerror());
+          } else {
+            warn("Can't get size of 'G1FullGCCompactTask::copy_object_to_new_location(oop obj)' in libjvm.so (dlerror=%s)", dlerror());
+          }
+        }
+      }
+      // If we found the call to 'memmove()' patch it to call into our local 'jBalloon_memmove()' instead.
+      if (patch_addr != 0) {
+        log(INFO, "Found call to 'memmove()' in 'G1FullGCCompactTask::compact_humongous_obj(HeapRegion*)' at %p\n", patch_addr - 1);
+        intptr_t patch_target_offset = (uintptr_t)jBallon_memmove - (patch_addr + 4 /* the offset is relative to the IP after the CALL instruction*/);
+        if (llabs(patch_target_offset) < (1L << 31) - 1) {
+          log(INFO, "Call to 'memmove()' in 'G1FullGCCompactTask::compact_humongous_obj(HeapRegion*)' can be patched directly\n");
+
+          mprotect((void*)(patch_addr & ~(PAGE_SIZE - 1)), PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC);
+          *(int32_t*)patch_addr = patch_target_offset;
+          mprotect((void*)(patch_addr & ~(PAGE_SIZE - 1)), PAGE_SIZE, PROT_READ | PROT_EXEC);
+
+          use_jBallon_memmove = true;
+        } else {
+          log(INFO, "Patching 'memmove()' in 'G1FullGCCompactTask::compact_humongous_obj(HeapRegion*)' require a trampoline\n");
+        }
+      } else {
+        warn("Can't find call to 'memmove()' in 'G1FullGCCompactTask::compact_humongous_obj(HeapRegion*)'\n");
+      }
+    } else {
+      warn("Can't get size of 'G1FullGCCompactTask::compact_humongous_obj(HeapRegion*)' in libjvm.so (dlerror=%s)", dlerror());
+    }
+  } else {
+    warn("Can't get address of 'G1FullGCCompactTask::compact_humongous_obj(HeapRegion*)' in libjvm.so (dlerror=%s)", dlerror());
+  }
+
+  if (!use_jBallon_memmove) {
+  // userfaultfd initialization
+
   uffd = syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY /* useful for debugging */);
   if (uffd == -1) {
     warn("syscall(SYS_userfaultfd)");
@@ -541,6 +879,8 @@ JNIEXPORT jboolean JNICALL Java_io_simonis_jballoon_JBalloon_nativeInit(JNIEnv* 
     pthread_cond_wait(&cond, &lock);
   }
 
+  } // if (!use_jBallon_memmove)
+
   jfieldID balloonMaxNrOfBalloonsField = env->GetStaticFieldID(jballoonCls, "MAX_NR_OF_BALLOONS", "I");
   if (balloonMaxNrOfBalloonsField == nullptr) {
     log(ERROR, "Can't find io.simonis.jballoon.JBalloon.Balloon.MAX_NR_OF_BALLOONS field");
@@ -554,7 +894,7 @@ JNIEXPORT jboolean JNICALL Java_io_simonis_jballoon_JBalloon_nativeInit(JNIEnv* 
   }
 
   // Try to get the heap size and base address from the vmStructs
-  void* handle = dlopen(NULL, RTLD_LAZY);
+  void* handle = dlopen(nullptr, RTLD_LAZY);
   if (handle) {
       VMStructEntry* vms = *(VMStructEntry**)dlsym(handle, "gHotSpotVMStructs");
       if (vms) {
@@ -636,7 +976,7 @@ JNIEXPORT jobject JNICALL Java_io_simonis_jballoon_JBalloon_inflateNative(JNIEnv
   long offset = (PAGE_SIZE - ((uintptr_t)bytes % PAGE_SIZE));
   jbyte* addr = bytes + offset;
   // We cut off the last page because optimized versions of memmove() may read the end of the "from" region although they copy
-  // from left to right and this might confuse our bookkeeping. 
+  // from left to right and this might confuse our bookkeeping.
   len = ((len - offset - PAGE_SIZE/* XXX */) / PAGE_SIZE) * PAGE_SIZE;
   if (madvise(addr, len, MADV_DONTNEED) != 0) {
     warn("inflateNative::madv(MADV_DONTNEED)");
@@ -644,6 +984,7 @@ JNIEXPORT jobject JNICALL Java_io_simonis_jballoon_JBalloon_inflateNative(JNIEnv
     return nullptr;
   }
   log(DEBUG, "inflateNative::madvise(%p, %d)\n", addr, len);
+  LOG(TRACE, "Java Heap -> (reserved/mincore/RSS) = (%dkb / %dkb / %dkb)\n", heapSizeBytes/1024, mincoreHeapSize()/1024, rssHeapSize()/1024);
   userfaultfd_register(addr, len);
   env->ReleasePrimitiveArrayCritical(array, bytes, 0);
 
@@ -745,7 +1086,7 @@ JNIEXPORT jlong JNICALL Java_io_simonis_jballoon_JBalloon_rssHeapSize(JNIEnv* en
         // And this solution doesn't require any elevated capabilities.
         int exclusive = (entry >> 56) & 1;
 
-        // Only pages which 
+        // Only pages which
         if (present && (exclusive || pfn) > 0) {
             counts++;
         }
