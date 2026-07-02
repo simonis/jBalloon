@@ -87,6 +87,56 @@ struct Balloon {
     objAddr(objAddr), addr(addr), len(len), id(id), fwdAddr(nullptr), overlapOffset(0), overlapAddr(nullptr) {}
 };
 
+// We only expect to support a small number of Balloons, so use a simple array for storing them for now
+static Balloon** balloons;
+static jlong id = 0;
+
+static Balloon* new_balloon(jbyte* objAddr, jbyte* addr, jint len) {
+  int i = 0;
+  while (balloons[i] != nullptr && ++i < MAX_NR_OF_BALLOONS);
+  if (i < MAX_NR_OF_BALLOONS) {
+    balloons[i] = new Balloon(objAddr, addr, len, id++);
+    return balloons[i];
+  } else {
+    return nullptr;
+  }
+}
+
+static Balloon* find_balloon(jbyte* addr, jlong id) {
+  Balloon* found = nullptr;
+  jlong foundId = -1;
+  for (int i = 0; i < MAX_NR_OF_BALLOONS; i++) {
+    if (balloons[i] != nullptr && addr >= balloons[i]->addr && addr < (balloons[i]->addr + balloons[i]->len)) {
+      if (balloons[i]->id == id) {
+        // Exact match
+        return balloons[i];
+      } else if (id == -1) {
+        // Find the latest Balloon at this address
+        if (balloons[i]->id > foundId) {
+          foundId = balloons[i]->id;
+          found = balloons[i];
+        }
+      }
+    }
+  }
+  return found;
+}
+
+static jboolean userfaultfd_unregister(void* addr, size_t len);
+
+static jboolean remove_balloon(Balloon* balloon) {
+  for (int i = 0; i < MAX_NR_OF_BALLOONS; i++) {
+    if (balloons[i] == balloon) {
+      balloons[i] = nullptr;
+      // Unregister balloon with userfaulfd
+      userfaultfd_unregister(balloon->addr, balloon->len);
+      delete balloon;
+      return true;
+    }
+  }
+  return false;
+}
+
 enum LogLevel {
   UNINITIALIZED = -1,
   TRACE,
@@ -145,6 +195,44 @@ static int log(LogLevel l, const char* format, ...) {
     return ret;
   }
   return 0;
+}
+
+// This is jBallons's replacement for the transitive call to 'memmove()' in
+// 'G1FullGCCompactTask::compact_humongous_obj()' which is reached through the
+// call chain: 'copy_object_to_new_locatio()' -> 'Copy::aligned_conjoint_words()'
+// -> 'pd_aligned_conjoint_words()' -> 'pd_conjoint_words()' -> 'memmove()'.
+extern "C" void* jBallon_memmove(void* dest, const void* src, size_t n) {
+  // Balloon object are always humongous, so we can do this first, cheap check.
+  if (n >= regionSize / 2) {
+    // Now check if it is really a jBalloon object.
+    Balloon* balloon = nullptr;
+    for (int i = 0; i < MAX_NR_OF_BALLOONS; i++) {
+      if (balloons[i] != nullptr && balloons[i]->objAddr == src) {
+        balloon = balloons[i];
+        break;
+      }
+    }
+    if (balloon != nullptr) {
+      LOG(TRACE, "Java Heap -> (reserved/mincore/RSS) = (%dkb / %dkb / %dkb)\n", heapSizeBytes/1024, mincoreHeapSize()/1024, rssHeapSize()/1024);
+      // Only copy the object header
+      memmove(dest, src, 16);
+      // madvise the balloon at the new location
+      size_t offset = balloon->addr - balloon->objAddr;
+      if (madvise((char*)dest + offset, balloon->len, MADV_DONTNEED) != 0) {
+        warn("jBallon_memmove::madv(MADV_DONTNEED)");
+      }
+      log(DEBUG, "jBallon_memmove::madvise(%p, %d)\n", (char*)dest + offset, balloon->len);
+      // And update the Balloon data with the new location
+      balloon->objAddr = (jbyte*)dest;
+      balloon->addr = (jbyte*)dest + offset;
+      LOG(TRACE, "Java Heap -> (reserved/mincore/RSS) = (%dkb / %dkb / %dkb)\n", heapSizeBytes/1024, mincoreHeapSize()/1024, rssHeapSize()/1024);
+
+      return dest;
+    }
+    // Fallthrough
+  }
+
+  return memmove(dest, src, n);
 }
 
 // This function takes a handle to a loaded shared library and the name of an undefined
@@ -289,13 +377,14 @@ static bool is_address_in_executable_segment(void* dl_handle, uintptr_t target_a
   return false; // Address is outside of any executable segment
 }
 
-// Checks if a CALL instruction ('0xe8' on x86) in a shared library calls the
-// function 'fun_name' (which is external to that library) through the
+// Checks if a x86_64 CALL instruction (i.e. '0xe8') in a shared library calls
+// the function 'fun_name' (which is external to that library) through the
 // procedure linkage table (PLT) and the GOT (Global Offset Table).
-//
-// TODO: this code currently only works for x86_64, port it to aarch64 as well!
 static bool verify_is_got_func_call(void* dl_handle, uintptr_t call_addr, const char* fun_name) {
   // On x86, a call is '0x8e' plus a 32-bit (i.e. four bytes) offset.
+  if (*(char*)call_addr != (char)0xe8) {
+    return false;
+  }
   int32_t relative_offset;
   memcpy(&relative_offset, (void*)(call_addr + 1), 4);
 
@@ -326,6 +415,175 @@ static bool verify_is_got_func_call(void* dl_handle, uintptr_t call_addr, const 
   uintptr_t fun_got_entry_addr = get_got_address(dl_handle, fun_name);
 
   return (fun_got_entry_addr != 0 && got_entry_addr == fun_got_entry_addr);
+}
+
+#if defined(__x86_64__)
+
+#define INSTR_INC 1
+
+// Checks if a x86_64 CALL instruction ('0xe8') in a shared library calls the
+// library-internal function 'function'.
+static bool verify_is_func_call(uintptr_t call_addr, void* function) {
+  // On x86, a call is '0x8e' plus a 32-bit (i.e. four bytes) offset.
+  if (*(char*)call_addr != (char)0xe8) {
+    return false;
+  }
+  int32_t relative_offset;
+  memcpy(&relative_offset, (void*)(call_addr + 1), 4);
+  if (call_addr + 5 + relative_offset == (uintptr_t)function) {
+    return true;
+  } else {
+    return false;
+  }
+}
+
+#elif defined(__aarch64__)
+
+#define INSTR_INC 4
+
+// Checks if a aarch64 BL instruction ('0b100101') in a shared library calls the
+// library-internal function 'function'.
+static bool verify_is_func_call(uintptr_t call_addr, void* function) {
+  // On aarch64, a BL call is '0b100101' (6 bit) and a 26-bit, signed offset which, left-shifted
+  // by two and added to the current instruction pointer, gives the target address of the call.
+  int32_t relative_offset;
+  memcpy(&relative_offset, (void*)call_addr, 4);
+  relative_offset = (relative_offset & 0b00000011111111111111111111111111) << 2;
+
+  if (call_addr + relative_offset == (uintptr_t)function) {
+    return true;
+  } else {
+    return false;
+  }
+}
+
+#else
+
+#define INSTR_INC 1
+
+#endif
+
+static bool can_use_compact_humongous_obj_patching() {
+  Dl_info dl_info;
+  if (dladdr((void*)jBallon_memmove, &dl_info) != 0) {
+    jBalloonBase = (char*)dl_info.dli_fbase;
+    log(INFO, "jballoon.so loaded at %p\n", jBalloonBase);
+  } else {
+    warn("Can't get base address of jballoon.so");
+  }
+
+  void* libjvm_handle = dlopen("libjvm.so", RTLD_NOLOAD | RTLD_LAZY);
+  if (libjvm_handle == nullptr) {
+    log(ERROR, "libjvm.so must be loaded at this point.\n");
+    return false;
+  }
+
+  // Locate 'G1FullGCCompactTask::compact_humongous_obj(HeapRegion*)' in libjvm.so and get its size
+  size_t compact_humongous_obj_size = 0;
+  const char* copy_object_to_new_location_name = "_ZN19G1FullGCCompactTask27copy_object_to_new_locationEP7oopDesc";
+  const char* compact_humongous_obj_name = "_ZN19G1FullGCCompactTask21compact_humongous_objEP10HeapRegion";
+  if (javaVersion > 21) {
+    // 'HeapRegion' was renamed to 'G1HeapRegion' in JDK 2X
+    compact_humongous_obj_name = "_ZN19G1FullGCCompactTask21compact_humongous_objEP12G1HeapRegion";
+  }
+#if defined(__aarch64__)
+  // '_Copy_conjoint_words()' is a generated stub which is used on aarch64 instead of 'memmove()'
+  char* copy_conjoint_words_addr = (char*)find_local_symbol(libjvm_handle, "_Copy_conjoint_words", nullptr);
+  if (copy_conjoint_words_addr != nullptr) {
+    log(INFO, "Located '_Copy_conjoint_words()' at %p\n", copy_conjoint_words_addr);
+  } else {
+    warn("Can't find '_Copy_conjoint_words()' in libjvm.so (dlerror=%s)", dlerror());
+    return false;
+  }
+#endif
+  char* compact_humongous_obj_addr = (char*)find_local_symbol(libjvm_handle, compact_humongous_obj_name, &compact_humongous_obj_size);
+  if (compact_humongous_obj_addr != nullptr) {
+    log(INFO, "Located 'G1FullGCCompactTask::compact_humongous_obj(HeapRegion*)' at %p\n", compact_humongous_obj_addr);
+    if (compact_humongous_obj_size != 0) {
+      log(INFO, "Size of 'G1FullGCCompactTask::compact_humongous_obj(HeapRegion*)' is %d\n", compact_humongous_obj_size);
+      uintptr_t patch_addr = 0;
+      // Now try to find a call to 'memmove()'/'_Copy_conjoint_words()' in 'G1FullGCCompactTask::compact_humongous_obj()'
+      for (char* start = compact_humongous_obj_addr; start < compact_humongous_obj_addr + compact_humongous_obj_size; start += INSTR_INC) {
+#if defined(__x86_64)
+        if (verify_is_got_func_call(libjvm_handle, (uintptr_t)start, "memmove")) {
+#elif defined(__aarch64__)
+        if (verify_is_func_call((uintptr_t)start, copy_conjoint_words_addr)) {
+#else
+        if (true) {
+          log(WARNING, "compact_humongous_obj_patching() currently only implemented for x86_64 and aarch64\n");
+          return false;
+#endif
+          patch_addr = (uintptr_t)(start + 1);
+          break;
+        }
+      }
+      // If we didn't find the call to 'memmove()'/'_Copy_conjoint_words()' in 'G1FullGCCompactTask::compact_humongous_obj()'
+      // it can be that 'G1FullGCCompactTask::compact_humongous_obj()' didn't inline 'G1FullGCCompactTask::copy_object_to_new_location()'.
+      // So check if we can find a call to 'G1FullGCCompactTask::copy_object_to_new_location()' in
+      // 'G1FullGCCompactTask::compact_humongous_obj()' and if that's the case, look for the 'memmove()'/'_Copy_conjoint_words()'
+      // call in 'G1FullGCCompactTask::copy_object_to_new_location()'.
+      if (patch_addr == 0) {
+        size_t copy_object_to_new_location_size = 0;
+        char* copy_object_to_new_location_addr = (char*)find_local_symbol(libjvm_handle,
+                                                                          copy_object_to_new_location_name,
+                                                                          &copy_object_to_new_location_size);
+        if (copy_object_to_new_location_addr != nullptr && copy_object_to_new_location_size != 0) {
+          log(INFO, "Located 'G1FullGCCompactTask::copy_object_to_new_location(oop obj)' at %p\n", copy_object_to_new_location_addr);
+          log(INFO, "Size of 'G1FullGCCompactTask::copy_object_to_new_location(oop obj)' is %d\n", copy_object_to_new_location_size);
+          // Now try to find a call to 'G1FullGCCompactTask::copy_object_to_new_location()' in 'G1FullGCCompactTask::compact_humongous_obj()'.
+          for (char* start = compact_humongous_obj_addr; start < compact_humongous_obj_addr + compact_humongous_obj_size; start += INSTR_INC) {
+            if (verify_is_func_call((uintptr_t)start, copy_object_to_new_location_addr)) {
+              // 'G1FullGCCompactTask::compact_humongous_obj()' calls 'G1FullGCCompactTask::copy_object_to_new_location()' so we can find
+              // the call to 'memmove()'/'_Copy_conjoint_words()' in 'G1FullGCCompactTask::copy_object_to_new_location()' and patch it there.
+              log(INFO, "'G1FullGCCompactTask::compact_humongous_obj()' calls 'copy_object_to_new_location()' at %p\n", start);
+
+              // Now try to find a call to 'memmove()'/'_Copy_conjoint_words()' in 'G1FullGCCompactTask::compact_humongous_obj()'
+              for (char* s = copy_object_to_new_location_addr; s < copy_object_to_new_location_addr + copy_object_to_new_location_size; s += INSTR_INC) {
+#if defined(__x86_64)
+                if (verify_is_got_func_call(libjvm_handle, (uintptr_t)s, "memmove")) {
+#elif defined(__aarch64__)
+                if (verify_is_func_call((uintptr_t)s, copy_conjoint_words_addr)) {
+#endif
+                  patch_addr = (uintptr_t)(s + 1);
+                  break;
+                }
+              }
+              break;
+            }
+          }
+        } else {
+          if (copy_object_to_new_location_addr != nullptr) {
+            warn("Can't get address of 'G1FullGCCompactTask::copy_object_to_new_location(oop obj)' in libjvm.so (dlerror=%s)", dlerror());
+          } else {
+            warn("Can't get size of 'G1FullGCCompactTask::copy_object_to_new_location(oop obj)' in libjvm.so (dlerror=%s)", dlerror());
+          }
+        }
+      }
+      // If we found the call to 'memmove()' patch it to call into our local 'jBalloon_memmove()' instead.
+      if (patch_addr != 0) {
+        log(INFO, "Found call to 'memmove()' in 'G1FullGCCompactTask::compact_humongous_obj(HeapRegion*)' at %p\n", patch_addr - 1);
+        intptr_t patch_target_offset = (uintptr_t)jBallon_memmove - (patch_addr + 4 /* the offset is relative to the IP after the CALL instruction*/);
+        if (llabs(patch_target_offset) < (1L << 31) - 1) {
+          log(INFO, "Call to 'memmove()' in 'G1FullGCCompactTask::compact_humongous_obj(HeapRegion*)' can be patched directly\n");
+
+          mprotect((void*)(patch_addr & ~(PAGE_SIZE - 1)), PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC);
+          *(int32_t*)patch_addr = patch_target_offset;
+          mprotect((void*)(patch_addr & ~(PAGE_SIZE - 1)), PAGE_SIZE, PROT_READ | PROT_EXEC);
+
+          return true;
+        } else {
+          log(INFO, "Patching 'memmove()' in 'G1FullGCCompactTask::compact_humongous_obj(HeapRegion*)' require a trampoline\n");
+        }
+      } else {
+        warn("Can't find call to 'memmove()' in 'G1FullGCCompactTask::compact_humongous_obj(HeapRegion*)'\n");
+      }
+    } else {
+      warn("Can't get size of 'G1FullGCCompactTask::compact_humongous_obj(HeapRegion*)' in libjvm.so (dlerror=%s)", dlerror());
+    }
+  } else {
+    warn("Can't get address of 'G1FullGCCompactTask::compact_humongous_obj(HeapRegion*)' in libjvm.so (dlerror=%s)", dlerror());
+  }
+  return false;
 }
 
 static void* forwardingPointer(jlong* oop) {
@@ -385,54 +643,6 @@ static jboolean userfaultfd_zeropage(uffdio_range range, size_t mode = 0) {
   return true;
 }
 
-
-// We only expect to support a small number of Balloons, so use a simple array for storing them for now
-static Balloon** balloons;
-static jlong id = 0;
-
-static Balloon* new_balloon(jbyte* objAddr, jbyte* addr, jint len) {
-  int i = 0;
-  while (balloons[i] != nullptr && ++i < MAX_NR_OF_BALLOONS);
-  if (i < MAX_NR_OF_BALLOONS) {
-    balloons[i] = new Balloon(objAddr, addr, len, id++);
-    return balloons[i];
-  } else {
-    return nullptr;
-  }
-}
-
-static Balloon* find_balloon(jbyte* addr, jlong id) {
-  Balloon* found = nullptr;
-  jlong foundId = -1;
-  for (int i = 0; i < MAX_NR_OF_BALLOONS; i++) {
-    if (balloons[i] != nullptr && addr >= balloons[i]->addr && addr < (balloons[i]->addr + balloons[i]->len)) {
-      if (balloons[i]->id == id) {
-        // Exact match
-        return balloons[i];
-      } else if (id == -1) {
-        // Find the latest Balloon at this address
-        if (balloons[i]->id > foundId) {
-          foundId = balloons[i]->id;
-          found = balloons[i];
-        }
-      }
-    }
-  }
-  return found;
-}
-
-static jboolean remove_balloon(Balloon* balloon) {
-  for (int i = 0; i < MAX_NR_OF_BALLOONS; i++) {
-    if (balloons[i] == balloon) {
-      balloons[i] = nullptr;
-      // Unregister balloon with userfaulfd
-      userfaultfd_unregister(balloon->addr, balloon->len);
-      delete balloon;
-      return true;
-    }
-  }
-  return false;
-}
 
 // io.simonis.jballoon.JBalloon
 jclass jballoonCls;
@@ -637,44 +847,6 @@ static void* userfaultfd_handler(void* arg) {
     }
   }
   return nullptr;
-}
-
-// This is jBallons's replacement for the transitive call to 'memmove()' in
-// 'G1FullGCCompactTask::compact_humongous_obj()' which is reached through the
-// call chain: 'copy_object_to_new_locatio()' -> 'Copy::aligned_conjoint_words()'
-// -> 'pd_aligned_conjoint_words()' -> 'pd_conjoint_words()' -> 'memmove()'.
-extern "C" void* jBallon_memmove(void* dest, const void* src, size_t n) {
-  // Balloon object are always humongous, so we can do this first, cheap check.
-  if (n >= regionSize / 2) {
-    // Now check if it is really a jBalloon object.
-    Balloon* balloon = nullptr;
-    for (int i = 0; i < MAX_NR_OF_BALLOONS; i++) {
-      if (balloons[i] != nullptr && balloons[i]->objAddr == src) {
-        balloon = balloons[i];
-        break;
-      }
-    }
-    if (balloon != nullptr) {
-      LOG(TRACE, "Java Heap -> (reserved/mincore/RSS) = (%dkb / %dkb / %dkb)\n", heapSizeBytes/1024, mincoreHeapSize()/1024, rssHeapSize()/1024);
-      // Only copy the object header
-      memmove(dest, src, 16);
-      // madvise the balloon at the new location
-      size_t offset = balloon->addr - balloon->objAddr;
-      if (madvise((char*)dest + offset, balloon->len, MADV_DONTNEED) != 0) {
-        warn("jBallon_memmove::madv(MADV_DONTNEED)");
-      }
-      log(DEBUG, "jBallon_memmove::madvise(%p, %d)\n", (char*)dest + offset, balloon->len);
-      // And update the Balloon data with the new location
-      balloon->objAddr = (jbyte*)dest;
-      balloon->addr = (jbyte*)dest + offset;
-      LOG(TRACE, "Java Heap -> (reserved/mincore/RSS) = (%dkb / %dkb / %dkb)\n", heapSizeBytes/1024, mincoreHeapSize()/1024, rssHeapSize()/1024);
-
-      return dest;
-    }
-    // Fallthrough
-  }
-
-  return memmove(dest, src, n);
 }
 
 extern "C"
