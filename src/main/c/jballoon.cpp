@@ -197,11 +197,11 @@ static int log(LogLevel l, const char* format, ...) {
   return 0;
 }
 
-// This is jBallons's replacement for the transitive call to 'memmove()' in
+// This is jBalloons's replacement for the transitive call to 'memmove()' in
 // 'G1FullGCCompactTask::compact_humongous_obj()' which is reached through the
 // call chain: 'copy_object_to_new_locatio()' -> 'Copy::aligned_conjoint_words()'
 // -> 'pd_aligned_conjoint_words()' -> 'pd_conjoint_words()' -> 'memmove()'.
-extern "C" void* jBallon_memmove(void* dest, const void* src, size_t n) {
+extern "C" void* jBalloon_memmove(void* dest, const void* src, size_t n) {
   // Balloon object are always humongous, so we can do this first, cheap check.
   if (n >= regionSize / 2) {
     // Now check if it is really a jBalloon object.
@@ -219,9 +219,9 @@ extern "C" void* jBallon_memmove(void* dest, const void* src, size_t n) {
       // madvise the balloon at the new location
       size_t offset = balloon->addr - balloon->objAddr;
       if (madvise((char*)dest + offset, balloon->len, MADV_DONTNEED) != 0) {
-        warn("jBallon_memmove::madv(MADV_DONTNEED)");
+        warn("jBalloon_memmove::madv(MADV_DONTNEED)");
       }
-      log(DEBUG, "jBallon_memmove::madvise(%p, %d)\n", (char*)dest + offset, balloon->len);
+      log(DEBUG, "jBalloon_memmove::madvise(%p, %d)\n", (char*)dest + offset, balloon->len);
       // And update the Balloon data with the new location
       balloon->objAddr = (jbyte*)dest;
       balloon->addr = (jbyte*)dest + offset;
@@ -437,6 +437,24 @@ static bool verify_is_func_call(uintptr_t call_addr, void* function) {
   }
 }
 
+static bool patch_call_instr(uintptr_t call_addr, uintptr_t target, uintptr_t trampoline_addr) {
+  log(INFO, "Found call to 'memmove()' at %p\n", call_addr);
+  uintptr_t patch_addr = call_addr + 1;
+  intptr_t patch_target_offset = target - (patch_addr + 4 /* the offset is relative to the IP after the CALL instruction*/);
+  if (llabs(patch_target_offset) < (1L << 31) - 1) {
+    log(INFO, "Call to 'memmove()' can be patched directly\n");
+
+    mprotect((void*)(patch_addr & ~(PAGE_SIZE - 1)), PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC);
+    *(int32_t*)patch_addr = patch_target_offset;
+    mprotect((void*)(patch_addr & ~(PAGE_SIZE - 1)), PAGE_SIZE, PROT_READ | PROT_EXEC);
+
+    return true;
+  } else {
+    log(INFO, "Patching 'memmove()' requires a trampoline\n");
+    return false;
+  }
+}
+
 #elif defined(__aarch64__)
 
 #define INSTR_INC 4
@@ -446,15 +464,74 @@ static bool verify_is_func_call(uintptr_t call_addr, void* function) {
 static bool verify_is_func_call(uintptr_t call_addr, void* function) {
   // On aarch64, a BL call is '0b100101' (6 bit) and a 26-bit, signed offset which, left-shifted
   // by two and added to the current instruction pointer, gives the target address of the call.
-  int32_t relative_offset;
+  int32_t relative_offset, instr;
   memcpy(&relative_offset, (void*)call_addr, 4);
-  relative_offset = (relative_offset & 0b00000011111111111111111111111111) << 2;
+  instr =           (relative_offset & 0b10010100000000000000000000000000);
+  // First we sign-extend the offset from 26 to 32 bit, then we left-shift by two (i.e. multiply by four)
+  relative_offset = (((relative_offset & 0b00000011111111111111111111111111) << 6) >> 6) << 2;
 
-  if (call_addr + relative_offset == (uintptr_t)function) {
+  if (instr == 0b10010100000000000000000000000000 && call_addr + relative_offset == (uintptr_t)function) {
     return true;
   } else {
     return false;
   }
+}
+
+void flush_caches(char* addr, size_t size) {
+    // 1. Flush Data Cache to Point of Unification
+    asm volatile("dc cvau, %0" :: "r"(addr) : "memory");
+    // 2. Wait for Data Cache clean to complete globally
+    asm volatile("dsb ish" ::: "memory");
+    // 3. Invalidate Instruction Cache to Point of Unification
+    asm volatile("ic ivau, %0" :: "r"(addr) : "memory");
+    // 4. Wait for Instruction Cache invalidation to complete globally
+    asm volatile("dsb ish" ::: "memory");
+    // 5. Flush the CPU pipeline execution fetch buffers
+    asm volatile("isb" ::: "memory");
+}
+
+
+static bool patch_call_instr(uintptr_t patch_addr, uintptr_t  target, uintptr_t trampoline_addr) {
+  log(INFO, "Found call to '_Copy_conjoint_words()' at %p\n", patch_addr);
+
+  intptr_t patch_target_offset = target - patch_addr /* the offset is relative to the IP at the BL instruction*/;
+  if (llabs(patch_target_offset) >= (1L << 26) - 1) {
+    log(INFO, "Patching '_Copy_conjoint_words()' requires a trampoline\n");
+
+    patch_target_offset = trampoline_addr - patch_addr;
+    if (llabs(patch_target_offset) >= (1L << 26) - 1) {
+      log(INFO, "Trampoline address %p too far away from patch address %p (%d)\n", trampoline_addr, patch_addr, patch_target_offset);
+      return false;
+    }
+
+    // Create the trampoline
+    mprotect((void*)(trampoline_addr & ~(PAGE_SIZE - 1)), PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC);
+    uint32_t* trampoline = (uint32_t*)trampoline_addr;
+    // movz x16, #(bits 0-15)
+    trampoline[0] = 0xD2800010 | (((target >> 0)  & 0xFFFF) << 5);
+    // movk x16, #(bits 16-31), lsl #16
+    trampoline[1] = 0xF2A00010 | (((target >> 16) & 0xFFFF) << 5);
+    // movk x16, #(bits 32-47), lsl #32
+    trampoline[2] = 0xF2C00010 | (((target >> 32) & 0xFFFF) << 5);
+    // movk x16, #(bits 48-63), lsl #48
+    trampoline[3] = 0xF2E00010 | (((target >> 48) & 0xFFFF) << 5);
+    // br x16
+    trampoline[4] = 0xD61F0200;
+    mprotect((void*)(trampoline_addr & ~(PAGE_SIZE - 1)), PAGE_SIZE, PROT_READ | PROT_EXEC);
+
+    // Flush cache for the newly generated instructions
+    flush_caches((char*)trampoline_addr, 5 * sizeof(uint32_t));
+
+  } else {
+    log(INFO, "Call to '_Copy_conjoint_words()' can be patched directly\n");
+  }
+
+  mprotect((void*)(patch_addr & ~(PAGE_SIZE - 1)), PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC);
+  *(int32_t*)patch_addr = 0b10010100000000000000000000000000 | ((((int32_t)patch_target_offset) >> 2) & 0b00000011111111111111111111111111);
+  mprotect((void*)(patch_addr & ~(PAGE_SIZE - 1)), PAGE_SIZE, PROT_READ | PROT_EXEC);
+  flush_caches((char*)patch_addr, sizeof(int32_t));
+
+  return true;
 }
 
 #else
@@ -465,7 +542,7 @@ static bool verify_is_func_call(uintptr_t call_addr, void* function) {
 
 static bool can_use_compact_humongous_obj_patching() {
   Dl_info dl_info;
-  if (dladdr((void*)jBallon_memmove, &dl_info) != 0) {
+  if (dladdr((void*)jBalloon_memmove, &dl_info) != 0) {
     jBalloonBase = (char*)dl_info.dli_fbase;
     log(INFO, "jballoon.so loaded at %p\n", jBalloonBase);
   } else {
@@ -486,6 +563,18 @@ static bool can_use_compact_humongous_obj_patching() {
     // 'HeapRegion' was renamed to 'G1HeapRegion' in JDK 2X
     compact_humongous_obj_name = "_ZN19G1FullGCCompactTask21compact_humongous_objEP12G1HeapRegion";
   }
+  // jBalloon currently only works for G1 GC so we can "misuse" the 'SerialHeap::SerialHeap()'
+  // constructor code as memory region for the trampolines, in case we need them for patching.
+  const char* serialHeap_constr_name = "_ZN10SerialHeapC1Ev";
+  size_t serialHeap_constr_size = 0;
+  char* serialHeap_constr_addr = (char*)find_local_symbol(libjvm_handle, serialHeap_constr_name, &serialHeap_constr_size);
+  if (serialHeap_constr_addr != nullptr && serialHeap_constr_size > 20 /* Must be enough to hold the trampoline code */) {
+    log(INFO, "Located 'SerialHeap::SerialHeap()' at %p (size = %d)\n", serialHeap_constr_addr, serialHeap_constr_size);
+  } else {
+    warn("Can't find 'SerialHeap::SerialHeap()' in libjvm.so (dlerror=%s)", dlerror());
+    return false;
+  }
+
 #if defined(__aarch64__)
   // '_Copy_conjoint_words()' is a generated stub which is used on aarch64 instead of 'memmove()'
   char* copy_conjoint_words_addr = (char*)find_local_symbol(libjvm_handle, "_Copy_conjoint_words", nullptr);
@@ -513,7 +602,7 @@ static bool can_use_compact_humongous_obj_patching() {
           log(WARNING, "compact_humongous_obj_patching() currently only implemented for x86_64 and aarch64\n");
           return false;
 #endif
-          patch_addr = (uintptr_t)(start + 1);
+          patch_addr = (uintptr_t)start;
           break;
         }
       }
@@ -537,14 +626,14 @@ static bool can_use_compact_humongous_obj_patching() {
               // the call to 'memmove()'/'_Copy_conjoint_words()' in 'G1FullGCCompactTask::copy_object_to_new_location()' and patch it there.
               log(INFO, "'G1FullGCCompactTask::compact_humongous_obj()' calls 'copy_object_to_new_location()' at %p\n", start);
 
-              // Now try to find a call to 'memmove()'/'_Copy_conjoint_words()' in 'G1FullGCCompactTask::compact_humongous_obj()'
+              // Now try to find a call to 'memmove()'/'_Copy_conjoint_words()' in 'G1FullGCCompactTask::copy_object_to_new_location()'
               for (char* s = copy_object_to_new_location_addr; s < copy_object_to_new_location_addr + copy_object_to_new_location_size; s += INSTR_INC) {
 #if defined(__x86_64)
                 if (verify_is_got_func_call(libjvm_handle, (uintptr_t)s, "memmove")) {
 #elif defined(__aarch64__)
                 if (verify_is_func_call((uintptr_t)s, copy_conjoint_words_addr)) {
 #endif
-                  patch_addr = (uintptr_t)(s + 1);
+                  patch_addr = (uintptr_t)s;
                   break;
                 }
               }
@@ -559,23 +648,11 @@ static bool can_use_compact_humongous_obj_patching() {
           }
         }
       }
-      // If we found the call to 'memmove()' patch it to call into our local 'jBalloon_memmove()' instead.
+      // If we found the call to 'memmove()'/'_Copy_conjoint_words()' patch it to call into our local 'jBalloon_memmove()' instead.
       if (patch_addr != 0) {
-        log(INFO, "Found call to 'memmove()' in 'G1FullGCCompactTask::compact_humongous_obj(HeapRegion*)' at %p\n", patch_addr - 1);
-        intptr_t patch_target_offset = (uintptr_t)jBallon_memmove - (patch_addr + 4 /* the offset is relative to the IP after the CALL instruction*/);
-        if (llabs(patch_target_offset) < (1L << 31) - 1) {
-          log(INFO, "Call to 'memmove()' in 'G1FullGCCompactTask::compact_humongous_obj(HeapRegion*)' can be patched directly\n");
-
-          mprotect((void*)(patch_addr & ~(PAGE_SIZE - 1)), PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC);
-          *(int32_t*)patch_addr = patch_target_offset;
-          mprotect((void*)(patch_addr & ~(PAGE_SIZE - 1)), PAGE_SIZE, PROT_READ | PROT_EXEC);
-
-          return true;
-        } else {
-          log(INFO, "Patching 'memmove()' in 'G1FullGCCompactTask::compact_humongous_obj(HeapRegion*)' require a trampoline\n");
-        }
+        return patch_call_instr(patch_addr, (uintptr_t)jBalloon_memmove, (uintptr_t)serialHeap_constr_addr);
       } else {
-        warn("Can't find call to 'memmove()' in 'G1FullGCCompactTask::compact_humongous_obj(HeapRegion*)'\n");
+        warn("Can't find call to 'memmove()'/'_Copy_conjoint_words()'\n");
       }
     } else {
       warn("Can't get size of 'G1FullGCCompactTask::compact_humongous_obj(HeapRegion*)' in libjvm.so (dlerror=%s)", dlerror());
@@ -912,10 +989,10 @@ JNIEXPORT jboolean JNICALL Java_io_simonis_jballoon_JBalloon_nativeInit(JNIEnv* 
   jfieldID pageSizeField = env->GetStaticFieldID(balloonCls, "PAGE_SIZE", "I");
   env->SetStaticIntField(balloonCls, pageSizeField, PAGE_SIZE);
 
-  bool use_jBallon_memmove = false;
-
+  bool use_jBalloon_memmove = can_use_compact_humongous_obj_patching();
+  /*
   Dl_info dl_info;
-  if (dladdr((void*)jBallon_memmove, &dl_info) != 0) {
+  if (dladdr((void*)jBalloon_memmove, &dl_info) != 0) {
     jBalloonBase = (char*)dl_info.dli_fbase;
     log(INFO, "jballoon.so loaded at %p\n", jBalloonBase);
   } else {
@@ -994,7 +1071,7 @@ JNIEXPORT jboolean JNICALL Java_io_simonis_jballoon_JBalloon_nativeInit(JNIEnv* 
       // If we found the call to 'memmove()' patch it to call into our local 'jBalloon_memmove()' instead.
       if (patch_addr != 0) {
         log(INFO, "Found call to 'memmove()' in 'G1FullGCCompactTask::compact_humongous_obj(HeapRegion*)' at %p\n", patch_addr - 1);
-        intptr_t patch_target_offset = (uintptr_t)jBallon_memmove - (patch_addr + 4 /* the offset is relative to the IP after the CALL instruction*/);
+        intptr_t patch_target_offset = (uintptr_t)jBalloon_memmove - (patch_addr + 4); // the offset is relative to the IP after the CALL instruction
         if (llabs(patch_target_offset) < (1L << 31) - 1) {
           log(INFO, "Call to 'memmove()' in 'G1FullGCCompactTask::compact_humongous_obj(HeapRegion*)' can be patched directly\n");
 
@@ -1002,7 +1079,7 @@ JNIEXPORT jboolean JNICALL Java_io_simonis_jballoon_JBalloon_nativeInit(JNIEnv* 
           *(int32_t*)patch_addr = patch_target_offset;
           mprotect((void*)(patch_addr & ~(PAGE_SIZE - 1)), PAGE_SIZE, PROT_READ | PROT_EXEC);
 
-          use_jBallon_memmove = true;
+          use_jBalloon_memmove = true;
         } else {
           log(INFO, "Patching 'memmove()' in 'G1FullGCCompactTask::compact_humongous_obj(HeapRegion*)' require a trampoline\n");
         }
@@ -1015,8 +1092,8 @@ JNIEXPORT jboolean JNICALL Java_io_simonis_jballoon_JBalloon_nativeInit(JNIEnv* 
   } else {
     warn("Can't get address of 'G1FullGCCompactTask::compact_humongous_obj(HeapRegion*)' in libjvm.so (dlerror=%s)", dlerror());
   }
-
-  if (!use_jBallon_memmove) {
+  */
+  if (!use_jBalloon_memmove) {
   // userfaultfd initialization
 
   uffd = syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY /* useful for debugging */);
@@ -1051,7 +1128,7 @@ JNIEXPORT jboolean JNICALL Java_io_simonis_jballoon_JBalloon_nativeInit(JNIEnv* 
     pthread_cond_wait(&cond, &lock);
   }
 
-  } // if (!use_jBallon_memmove)
+  } // if (!use_jBalloon_memmove)
 
   jfieldID balloonMaxNrOfBalloonsField = env->GetStaticFieldID(jballoonCls, "MAX_NR_OF_BALLOONS", "I");
   if (balloonMaxNrOfBalloonsField == nullptr) {
