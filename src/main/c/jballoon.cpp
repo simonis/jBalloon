@@ -197,42 +197,43 @@ static int log(LogLevel l, const char* format, ...) {
   return 0;
 }
 
-// This is jBalloons's replacement for the transitive call to 'memmove()' in
-// 'G1FullGCCompactTask::compact_humongous_obj()' which is reached through the
-// call chain: 'copy_object_to_new_locatio()' -> 'Copy::aligned_conjoint_words()'
-// -> 'pd_aligned_conjoint_words()' -> 'pd_conjoint_words()' -> 'memmove()'.
-extern "C" void* jBalloon_memmove(void* dest, const void* src, size_t n) {
-  // Balloon object are always humongous, so we can do this first, cheap check.
-  if (n >= regionSize / 2) {
-    // Now check if it is really a jBalloon object.
-    Balloon* balloon = nullptr;
-    for (int i = 0; i < MAX_NR_OF_BALLOONS; i++) {
-      if (balloons[i] != nullptr && balloons[i]->objAddr == src) {
-        balloon = balloons[i];
-        break;
-      }
+// If the Java heap object at 'src' is a jBalloon object, "move" it to the
+// destination address 'dest'. For jBalloon objects, "moving" means to copy
+// the object header and MADV_DONTNEED the remaining part of the object at
+// the destination address. This ensures that memory which was released when
+// a jBalloon object was inflated, will remain released, even if that jBalloon
+// object is moved by the GC to a new location.
+// If the object at 'src' is not a jBallon object, this function will simply
+// return false and do nothing.
+// Note: 'n' is the size of the obejct in bytes!
+static bool move_if_jBalloon(void* dest, const void* src, size_t n) {
+  // Check if it is really a jBalloon object.
+  Balloon* balloon = nullptr;
+  for (int i = 0; i < MAX_NR_OF_BALLOONS; i++) {
+    if (balloons[i] != nullptr && balloons[i]->objAddr == src) {
+      balloon = balloons[i];
+      break;
     }
-    if (balloon != nullptr) {
-      LOG(TRACE, "Java Heap -> (reserved/mincore/RSS) = (%dkb / %dkb / %dkb)\n", heapSizeBytes/1024, mincoreHeapSize()/1024, rssHeapSize()/1024);
-      // Only copy the object header
-      memmove(dest, src, 16);
-      // madvise the balloon at the new location
-      size_t offset = balloon->addr - balloon->objAddr;
-      if (madvise((char*)dest + offset, balloon->len, MADV_DONTNEED) != 0) {
-        warn("jBalloon_memmove::madv(MADV_DONTNEED)");
-      }
-      log(DEBUG, "jBalloon_memmove::madvise(%p, %d)\n", (char*)dest + offset, balloon->len);
-      // And update the Balloon data with the new location
-      balloon->objAddr = (jbyte*)dest;
-      balloon->addr = (jbyte*)dest + offset;
-      LOG(TRACE, "Java Heap -> (reserved/mincore/RSS) = (%dkb / %dkb / %dkb)\n", heapSizeBytes/1024, mincoreHeapSize()/1024, rssHeapSize()/1024);
-
-      return dest;
-    }
-    // Fallthrough
   }
+  // TODO: assert that the size of balloon->objAddr equals n
+  if (balloon != nullptr) {
+    LOG(TRACE, "Java Heap -> (reserved/mincore/RSS) = (%dkb / %dkb / %dkb)\n", heapSizeBytes/1024, mincoreHeapSize()/1024, rssHeapSize()/1024);
+    // Only copy the object header
+    memmove(dest, src, 16);
+    // madvise the balloon at the new location
+    size_t offset = balloon->addr - balloon->objAddr;
+    if (madvise((char*)dest + offset, balloon->len, MADV_DONTNEED) != 0) {
+      warn("jBalloon_memmove::madv(MADV_DONTNEED)");
+    }
+    log(DEBUG, "jBalloon_memmove::madvise(%p, %d)\n", (char*)dest + offset, balloon->len);
+    // And update the Balloon data with the new location
+    balloon->objAddr = (jbyte*)dest;
+    balloon->addr = (jbyte*)dest + offset;
+    LOG(TRACE, "Java Heap -> (reserved/mincore/RSS) = (%dkb / %dkb / %dkb)\n", heapSizeBytes/1024, mincoreHeapSize()/1024, rssHeapSize()/1024);
 
-  return memmove(dest, src, n);
+    return true;
+  }
+  return false;
 }
 
 // This function takes a handle to a loaded shared library and the name of an undefined
@@ -421,6 +422,23 @@ static bool verify_is_got_func_call(void* dl_handle, uintptr_t call_addr, const 
 
 #define INSTR_INC 1
 
+// This is jBalloons's replacement for the transitive call to 'memmove()' in
+// 'G1FullGCCompactTask::compact_humongous_obj()' which is reached through the
+// call chain: 'copy_object_to_new_locatio()' -> 'Copy::aligned_conjoint_words()'
+// -> 'pd_aligned_conjoint_words()' -> 'pd_conjoint_words()' -> 'memmove()'.
+// Note: on x86_64, pd_conjoint_words() is implemented to call 'memmove()', after
+//       doing some argument shuffeling, because 'pd_conjoint_words()' takes 'src'
+//       as first, 'dest' as second and the size in words (i.e. 8 bytes) as third
+//       argument.
+extern "C" void* jBalloon_memmove(void* dest, const void* src, size_t n) {
+  // jBalloon objects are always humongous, so we can do this first, cheap check.
+  if (n >= (regionSize / 2) && move_if_jBalloon(dest, src, n)) {
+    return dest;
+  }
+  // Regular (i.e. non-jBalloon) object
+  return memmove(dest, src, n);
+}
+
 // Checks if a x86_64 CALL instruction ('0xe8') in a shared library calls the
 // library-internal function 'function'.
 static bool verify_is_func_call(uintptr_t call_addr, void* function) {
@@ -458,6 +476,31 @@ static bool patch_call_instr(uintptr_t call_addr, uintptr_t target, uintptr_t tr
 #elif defined(__aarch64__)
 
 #define INSTR_INC 4
+
+typedef void (*Copy_conjoint_words_fun)(const uintptr_t* from, uintptr_t* to, size_t count);
+Copy_conjoint_words_fun copy_conjoint_words_addr = nullptr;
+
+// This is jBalloons's replacement for the transitive call to '_Copy_conjoint_words()'
+// in 'G1FullGCCompactTask::compact_humongous_obj()' which is reached through the
+// call chain: 'copy_object_to_new_locatio()' -> 'Copy::aligned_conjoint_words()'
+// -> 'pd_aligned_conjoint_words()' -> 'pd_conjoint_words()' -> '_Copy_conjoint_words()'.
+// Note: on aarch64, 'pd_conjoint_words()' is implemented to call '_Copy_conjoint_words()',
+//       for objects larger than 8 words (i.e. 64 bytes) which is fine for us, becausea we
+//       are only interested in humongous objects anyway. '_Copy_conjoint_words()' has the
+//       same signature like doing 'pd_conjoint_words()' (i.e. 'src', 'dest' and size in
+//       8-byte words) so we have to manually adjust the parameters before calling
+//       'move_if_jBalloon()' which takes 'dest' first, then 'src' and the size in bytes.
+extern "C" void* jBalloon_memmove(const void* src, void* dest, size_t n) {
+  // For '_Copy_conjoint_words()' the size 'n' is given in units of 'HeapWordSize'.
+  n = n * 8 /* HotSpot's 'HeapWordSize' which is always 8 on 64-bit architectures */;
+  // jBalloon objects are always humongous, so we can do this first, cheap check.
+  if (n >= (regionSize / 2) && move_if_jBalloon(dest, src, n)) {
+    return dest;
+  }
+  // Regular (i.e. non-jBalloon) object
+  copy_conjoint_words_addr((const uintptr_t*)src, (uintptr_t*)dest, n / 8);
+  return dest;
+}
 
 // Checks if a aarch64 BL instruction ('0b100101') in a shared library calls the
 // library-internal function 'function'.
@@ -507,16 +550,17 @@ static bool patch_call_instr(uintptr_t patch_addr, uintptr_t  target, uintptr_t 
     // Create the trampoline
     mprotect((void*)(trampoline_addr & ~(PAGE_SIZE - 1)), PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC);
     uint32_t* trampoline = (uint32_t*)trampoline_addr;
-    // movz x16, #(bits 0-15)
-    trampoline[0] = 0xD2800010 | (((target >> 0)  & 0xFFFF) << 5);
-    // movk x16, #(bits 16-31), lsl #16
-    trampoline[1] = 0xF2A00010 | (((target >> 16) & 0xFFFF) << 5);
-    // movk x16, #(bits 32-47), lsl #32
-    trampoline[2] = 0xF2C00010 | (((target >> 32) & 0xFFFF) << 5);
-    // movk x16, #(bits 48-63), lsl #48
-    trampoline[3] = 0xF2E00010 | (((target >> 48) & 0xFFFF) << 5);
-    // br x16
-    trampoline[4] = 0xD61F0200;
+    // We use the caller-save argument register 'x4' for loading the target address.
+    // movz x4, #(bits 0-15)
+    trampoline[0] = 0xD2800004 | (((target >> 0)  & 0xFFFF) << 5);
+    // movk x4, #(bits 16-31), lsl #16
+    trampoline[1] = 0xF2A00004 | (((target >> 16) & 0xFFFF) << 5);
+    // movk x4, #(bits 32-47), lsl #32
+    trampoline[2] = 0xF2C00004 | (((target >> 32) & 0xFFFF) << 5);
+    // movk x4, #(bits 48-63), lsl #48
+    trampoline[3] = 0xF2E00004 | (((target >> 48) & 0xFFFF) << 5);
+    // br x4 (Branch to the target address, preserving X0-X3 and X30)
+    trampoline[4] = 0xD61F0080;
     mprotect((void*)(trampoline_addr & ~(PAGE_SIZE - 1)), PAGE_SIZE, PROT_READ | PROT_EXEC);
 
     // Flush cache for the newly generated instructions
@@ -577,7 +621,7 @@ static bool can_use_compact_humongous_obj_patching() {
 
 #if defined(__aarch64__)
   // '_Copy_conjoint_words()' is a generated stub which is used on aarch64 instead of 'memmove()'
-  char* copy_conjoint_words_addr = (char*)find_local_symbol(libjvm_handle, "_Copy_conjoint_words", nullptr);
+  copy_conjoint_words_addr = (Copy_conjoint_words_fun)find_local_symbol(libjvm_handle, "_Copy_conjoint_words", nullptr);
   if (copy_conjoint_words_addr != nullptr) {
     log(INFO, "Located '_Copy_conjoint_words()' at %p\n", copy_conjoint_words_addr);
   } else {
@@ -596,7 +640,7 @@ static bool can_use_compact_humongous_obj_patching() {
 #if defined(__x86_64)
         if (verify_is_got_func_call(libjvm_handle, (uintptr_t)start, "memmove")) {
 #elif defined(__aarch64__)
-        if (verify_is_func_call((uintptr_t)start, copy_conjoint_words_addr)) {
+        if (verify_is_func_call((uintptr_t)start, (void*)copy_conjoint_words_addr)) {
 #else
         if (true) {
           log(WARNING, "compact_humongous_obj_patching() currently only implemented for x86_64 and aarch64\n");
@@ -631,7 +675,7 @@ static bool can_use_compact_humongous_obj_patching() {
 #if defined(__x86_64)
                 if (verify_is_got_func_call(libjvm_handle, (uintptr_t)s, "memmove")) {
 #elif defined(__aarch64__)
-                if (verify_is_func_call((uintptr_t)s, copy_conjoint_words_addr)) {
+                if (verify_is_func_call((uintptr_t)s, (void*)copy_conjoint_words_addr)) {
 #endif
                   patch_addr = (uintptr_t)s;
                   break;
