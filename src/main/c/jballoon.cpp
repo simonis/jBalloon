@@ -203,9 +203,9 @@ static int log(LogLevel l, const char* format, ...) {
 // the destination address. This ensures that memory which was released when
 // a jBalloon object was inflated, will remain released, even if that jBalloon
 // object is moved by the GC to a new location.
-// If the object at 'src' is not a jBallon object, this function will simply
+// If the object at 'src' is not a jBalloon object, this function will simply
 // return false and do nothing.
-// Note: 'n' is the size of the obejct in bytes!
+// Note: 'n' is the size of the object in bytes!
 static bool move_if_jBalloon(void* dest, const void* src, size_t n) {
   // Check if it is really a jBalloon object.
   Balloon* balloon = nullptr;
@@ -424,10 +424,10 @@ static bool verify_is_got_func_call(void* dl_handle, uintptr_t call_addr, const 
 
 // This is jBalloons's replacement for the transitive call to 'memmove()' in
 // 'G1FullGCCompactTask::compact_humongous_obj()' which is reached through the
-// call chain: 'copy_object_to_new_locatio()' -> 'Copy::aligned_conjoint_words()'
+// call chain: 'copy_object_to_new_location()' -> 'Copy::aligned_conjoint_words()'
 // -> 'pd_aligned_conjoint_words()' -> 'pd_conjoint_words()' -> 'memmove()'.
 // Note: on x86_64, pd_conjoint_words() is implemented to call 'memmove()', after
-//       doing some argument shuffeling, because 'pd_conjoint_words()' takes 'src'
+//       doing some argument shuffling, because 'pd_conjoint_words()' takes 'src'
 //       as first, 'dest' as second and the size in words (i.e. 8 bytes) as third
 //       argument.
 extern "C" void* jBalloon_memmove(void* dest, const void* src, size_t n) {
@@ -459,18 +459,39 @@ static bool patch_call_instr(uintptr_t call_addr, uintptr_t target, uintptr_t tr
   log(INFO, "Found call to 'memmove()' at %p\n", call_addr);
   uintptr_t patch_addr = call_addr + 1;
   intptr_t patch_target_offset = target - (patch_addr + 4 /* the offset is relative to the IP after the CALL instruction*/);
-  if (llabs(patch_target_offset) < (1L << 31) - 1) {
-    log(INFO, "Call to 'memmove()' can be patched directly\n");
-
-    mprotect((void*)(patch_addr & ~(PAGE_SIZE - 1)), PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC);
-    *(int32_t*)patch_addr = patch_target_offset;
-    mprotect((void*)(patch_addr & ~(PAGE_SIZE - 1)), PAGE_SIZE, PROT_READ | PROT_EXEC);
-
-    return true;
-  } else {
+  if (llabs(patch_target_offset) >= (1L << 31) - 1) {
     log(INFO, "Patching 'memmove()' requires a trampoline\n");
-    return false;
+
+    patch_target_offset = trampoline_addr - (patch_addr + 4);
+    if (llabs(patch_target_offset) >= (1L << 31) - 1) {
+      log(INFO, "Trampoline address %p too far away from patch address %p (%d)\n", trampoline_addr, patch_addr, patch_target_offset);
+      return false;
+    }
+
+    // Create the trampoline. The trampoline consists of an indirect jump instruction (6 bytes) and
+    // an 8-byte constant in the memory right after the jump instruction (i.e. 6+8=14 bytes in total),
+    // so we must account for the fact that the trampoline might span two system pages.
+    int nr_of_pages = ((trampoline_addr + 6 + 8) / PAGE_SIZE) - (trampoline_addr / PAGE_SIZE) + 1;
+    mprotect((void*)(trampoline_addr & ~(PAGE_SIZE - 1)), nr_of_pages * PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC);
+    uint32_t* trampoline = (uint32_t*)trampoline_addr;
+    // JMP *0x0(%rip) : ff 25 00 00 00 00        ; JMP opcode (ff 25) plus 4-byte offset relative to current IP
+    //                : 00 00 00 00 00 00 00 00  ; 8-byte target address following directly in memory
+    trampoline[0] = 0x000025ff;
+    trampoline[1] = 0x00000000;
+    // The actual 64-bit, absolute JMP target address
+    memcpy((void*)(trampoline_addr + 6), &target, sizeof(target));
+    mprotect((void*)(trampoline_addr & ~(PAGE_SIZE - 1)), nr_of_pages * PAGE_SIZE, PROT_READ | PROT_EXEC);
+  } else {
+    log(INFO, "Call to 'memmove()' can be patched directly\n");
   }
+
+  // On x64, even a 32-bit part of an instruction can cross page boundaries
+  int nr_of_pages = ((patch_addr + 4) / PAGE_SIZE) - (patch_addr / PAGE_SIZE) + 1;
+  mprotect((void*)(patch_addr & ~(PAGE_SIZE - 1)), nr_of_pages * PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC);
+  *(int32_t*)patch_addr = patch_target_offset;
+  mprotect((void*)(patch_addr & ~(PAGE_SIZE - 1)), nr_of_pages * PAGE_SIZE, PROT_READ | PROT_EXEC);
+
+  return true;
 }
 
 #elif defined(__aarch64__)
@@ -482,10 +503,10 @@ Copy_conjoint_words_fun copy_conjoint_words_addr = nullptr;
 
 // This is jBalloons's replacement for the transitive call to '_Copy_conjoint_words()'
 // in 'G1FullGCCompactTask::compact_humongous_obj()' which is reached through the
-// call chain: 'copy_object_to_new_locatio()' -> 'Copy::aligned_conjoint_words()'
+// call chain: 'copy_object_to_new_location()' -> 'Copy::aligned_conjoint_words()'
 // -> 'pd_aligned_conjoint_words()' -> 'pd_conjoint_words()' -> '_Copy_conjoint_words()'.
 // Note: on aarch64, 'pd_conjoint_words()' is implemented to call '_Copy_conjoint_words()',
-//       for objects larger than 8 words (i.e. 64 bytes) which is fine for us, becausea we
+//       for objects larger than 8 words (i.e. 64 bytes) which is fine for us, because we
 //       are only interested in humongous objects anyway. '_Copy_conjoint_words()' has the
 //       same signature like doing 'pd_conjoint_words()' (i.e. 'src', 'dest' and size in
 //       8-byte words) so we have to manually adjust the parameters before calling
@@ -547,9 +568,9 @@ static bool patch_call_instr(uintptr_t patch_addr, uintptr_t  target, uintptr_t 
       return false;
     }
 
-    // Create the trampoline. The trampoline consists of 5 instructions (i.e. 5*32=160 bytes),
-    // so we must account for the fact that the trampoilne might span two system pages.
-    int nr_of_pages = ((trampoline_addr + 5*32) / PAGE_SIZE) - (trampoline_addr / PAGE_SIZE) + 1;
+    // Create the trampoline. The trampoline consists of 5 instructions (i.e. 5*4=20 bytes),
+    // so we must account for the fact that the trampoline might span two system pages.
+    int nr_of_pages = ((trampoline_addr + 5*4) / PAGE_SIZE) - (trampoline_addr / PAGE_SIZE) + 1;
     mprotect((void*)(trampoline_addr & ~(PAGE_SIZE - 1)), nr_of_pages * PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC);
     uint32_t* trampoline = (uint32_t*)trampoline_addr;
     // We use the caller-save argument register 'x4' for loading the target address.
@@ -563,7 +584,7 @@ static bool patch_call_instr(uintptr_t patch_addr, uintptr_t  target, uintptr_t 
     trampoline[3] = 0xF2E00004 | (((target >> 48) & 0xFFFF) << 5);
     // br x4 (Branch to the target address, preserving X0-X3 and X30)
     trampoline[4] = 0xD61F0080;
-    mprotect((void*)(trampoline_addr & ~(PAGE_SIZE - 1)), PAGE_SIZE, PROT_READ | PROT_EXEC);
+    mprotect((void*)(trampoline_addr & ~(PAGE_SIZE - 1)), nr_of_pages * PAGE_SIZE, PROT_READ | PROT_EXEC);
 
     // Flush cache for the newly generated instructions
     flush_caches((char*)trampoline_addr, 5 * sizeof(uint32_t));
