@@ -547,8 +547,10 @@ static bool patch_call_instr(uintptr_t patch_addr, uintptr_t  target, uintptr_t 
       return false;
     }
 
-    // Create the trampoline
-    mprotect((void*)(trampoline_addr & ~(PAGE_SIZE - 1)), PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC);
+    // Create the trampoline. The trampoline consists of 5 instructions (i.e. 5*32=160 bytes),
+    // so we must account for the fact that the trampoilne might span two system pages.
+    int nr_of_pages = ((trampoline_addr + 5*32) / PAGE_SIZE) - (trampoline_addr / PAGE_SIZE) + 1;
+    mprotect((void*)(trampoline_addr & ~(PAGE_SIZE - 1)), nr_of_pages * PAGE_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC);
     uint32_t* trampoline = (uint32_t*)trampoline_addr;
     // We use the caller-save argument register 'x4' for loading the target address.
     // movz x4, #(bits 0-15)

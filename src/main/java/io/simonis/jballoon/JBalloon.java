@@ -40,8 +40,13 @@ public class JBalloon {
         HotSpotDiagnosticMXBean hsDiagnosticBean = ManagementFactory.getPlatformMXBean(HotSpotDiagnosticMXBean.class);
         VMOption option = hsDiagnosticBean.getVMOption("UseCompressedOops");
         useCompressedOops = Boolean.parseBoolean(option.getValue());
-        option = hsDiagnosticBean.getVMOption("UseCompressedClassPointers");
-        useCompressedClassPointers = Boolean.parseBoolean(option.getValue());
+        try {
+            option = hsDiagnosticBean.getVMOption("UseCompressedClassPointers");
+            useCompressedClassPointers = Boolean.parseBoolean(option.getValue());
+        } catch (IllegalArgumentException iae) {
+            // 'UseCompressedClassPointers' was removed in JDK 27 and is the default now.
+            useCompressedClassPointers = true;
+        }
         try {
             option = hsDiagnosticBean.getVMOption("UseCompactObjectHeaders");
             compactObjectHeadersVM = true;
