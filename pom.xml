@@ -11,7 +11,22 @@
         <maven.compiler.source>17</maven.compiler.source>
         <maven.compiler.target>17</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <gcc.opt.level>-O3</gcc.opt.level>
     </properties>
+
+    <profiles>
+        <profile>
+            <id>debug</id>
+            <activation>
+                <property>
+                    <name>DEBUG</name>
+                </property>
+            </activation>
+            <properties>
+                <gcc.opt.level>-g</gcc.opt.level>
+            </properties>
+        </profile>
+    </profiles>
 
     <build>
         <plugins>
@@ -39,6 +54,23 @@
                 </execution>
               </executions>
             </plugin>
+           <plugin>
+              <groupId>org.apache.maven.plugins</groupId>
+              <artifactId>maven-javadoc-plugin</artifactId>
+              <version>3.11.2</version>
+              <configuration>
+                  <failOnError>true</failOnError>
+                  <detectLinks>true</detectLinks>
+              </configuration>
+              <executions>
+                <execution>
+                  <id>attach-javadocs</id>
+                  <goals>
+                    <goal>jar</goal>
+                  </goals>
+                </execution>
+              </executions>
+            </plugin>
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-antrun-plugin</artifactId>
@@ -54,17 +86,29 @@
                             <target>
                                 <mkdir dir="${project.build.outputDirectory}/native"/>
                                 <exec executable="g++" failonerror="true">
-                                    <arg value="-g"/>
+                                    <arg value="${gcc.opt.level}"/>
                                     <arg value="-shared"/>
                                     <arg value="-fPIC"/>
+                                    <arg value="-fno-exceptions"/>
+                                    <arg value="-fno-rtti"/>
                                     <arg value="-I${java.home}/include"/>
                                     <arg value="-I${java.home}/include/linux"/>
                                     <arg value="-o"/>
                                     <arg value="${project.build.outputDirectory}/native/libjballoon.so"/>
                                     <arg value="${project.basedir}/src/main/c/jballoon.cpp"/>
+                                    <!-- We could use '-nostdlib++' instead of '-nodefaultlibs -lc -lm -lgcc_s -lgcc' -->
+                                    <!-- but '-nostdlib++' is a Clang option which was only introduced in GCC 13 and -->
+                                    <!-- we want to be able to compile with older versions of GCC if possible. -->
+                                    <arg value="-nodefaultlibs"/>
+                                    <arg value="-lc"/>
+                                    <arg value="-lm"/>
+                                    <arg value="-lgcc_s"/>
+                                    <arg value="-lgcc"/>
+                                    <!-- Needed for the global new operator and requires the installation of 'libstdc++-static'. -->
+                                    <arg value="-lsupc++"/>
                                 </exec>
                                 <exec executable="gcc" failonerror="true">
-                                    <arg value="-g"/>
+                                    <arg value="${gcc.opt.level}"/>
                                     <arg value="-shared"/>
                                     <arg value="-fPIC"/>
                                     <arg value="-o"/>
