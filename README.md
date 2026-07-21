@@ -30,98 +30,133 @@ if (jBalloon != null) {
 }
 ```
 
+For more details see the [API documentation](https://simonis.github.io/jBalloon/io/simonis/jballoon/JBalloon.html).
 ## How it works
 
-Inflating a balloon works by allocating a long array of corresponding size and immediately freeing the array's content by calling `madvise(MADV_DONTNEED)` on its memory region. By contract, nobody will ever access the array, because it is not exposed by the *jBalloon* API.
+Inflating a balloon works by allocating a `long[]` array of corresponding size and immediately freeing the array's content by calling `madvise(MADV_DONTNEED)` on its memory region. By contract, nobody will ever access the array, because it is not exposed by the *jBalloon* API.
 
 `JBalloon::inflate(long size)` rounds up the `size` argument such that the underlying `long[]` array will occupy at least one full G1 region in order to qualify as a "humongous" object for the GC and to be at least as large as three system pages (i.e. `getconf PAGE_SIZE`).
 
 The contents of the backing `long[]` are only ever accessed during a G1 last-ditch Full GC when the GC moves/compacts humongous objects (see [JDK-8191565: Last-ditch Full GC should also move humongous objects](https://bugs.openjdk.org/browse/JDK-8191565)). When the GC reads the array, the kernel will page in the kernel `ZERO_PAGE` for memory regions which were previously `madvise(MADV_DONTNEED)` which doesn't consume any physical memory pages on the system. Moreover, *jBalloon* hooks into the G1 GC code to make sure that once copied, the backing `long[]` will be immediately `madvise(MADV_DONTNEED)` at the new location in order to preserve *jBalloon*'s invariant of freed heap memory. 
 
-## Building and Testing
+## Building
 
 ```terminal
 $ mvn clean package
 ```
 
-This will create `jballoon-1.0-SNAPSHOT.jar` and `jballoon-1.0-SNAPSHOT-tests.jar` in the target subdirectory. The former contains the `io.simonis.jballoon.jBallon` class and `libjballoon.so` which is the shared library with the native part of *jBalloon*. The latter contains the `io/simonis/jballoon/test/HumongousFragmentationTest` test which is based on OpenJDK's [`TestAllocHumongousFragment`](https://github.com/openjdk/jdk/blob/9cc01a9e0a2ca7dbe2650c852840e49418a742be/test/hotspot/jtreg/gc/TestAllocHumongousFragment.java) JTreg test. Originally, the test repeatedly creates a large number of humongous objects in a loop, some of which are retained for a certain amount of time while others are immediately released. This creates a highly fragmented heap and triggers frequent full GCs which will compact the humongous objects which are still alive in order to make room for new humongous allocations. This is the perfect scenario for testing that *jBalloon* memory balloons remain inflated even when moved by the GC. For testing *jBalloon*, I've modified the test to inflate a balloon after 10% of the allocations and deflate it again after 90% of the test's allocations.
+This will create `jballoon-1.0-SNAPSHOT.jar` and `jballoon-1.0-SNAPSHOT-tests.jar` in the target subdirectory. The former contains the `io.simonis.jballoon.jBallon` class and `libjballoon.so` which is the shared library with the native part of *jBalloon*.
+
+## Testing
+
+ `jballoon-1.0-SNAPSHOT-tests.jar` contains the `io/simonis/jballoon/test/HumongousFragmentationTest` test which is based on OpenJDK's [`TestAllocHumongousFragment`](https://github.com/openjdk/jdk/blob/9cc01a9e0a2ca7dbe2650c852840e49418a742be/test/hotspot/jtreg/gc/TestAllocHumongousFragment.java) JTreg test. Originally, the test repeatedly creates a large number of humongous objects in a loop, some of which are retained for a certain amount of time while others are immediately released. This creates a highly fragmented heap and triggers frequent full GCs which will compact the humongous objects which are still alive in order to make room for new humongous allocations. This is the perfect scenario for testing that *jBalloon* memory balloons remain inflated even when moved by the GC. For testing *jBalloon*, I've modified the test to inflate a balloon after 10% of the allocations and deflate it again after 90% of the test's allocations.
 
 In order to see how *jBalloon* works, the test has to be run with logging enabled. Logging in the native part is controlled by the environment variable `LOG` which can be one of `OFF` (the default), `ERROR`, `WARNING`, `INFO`, `DEBUG` and `TRACE`. Java logging is controlled by the system property `io.simonis.jballoon.logLevel` and can be any of Java's `java.util.logging` [logging Levels](https://docs.oracle.com/en/java/javase/25/docs/api/java.logging/java/util/logging/Level.html).
 
-We first run the test with the highest native logging level `TRACE`. Notice that this will considerably increase the run time of the test, because a this logging level the test will print an accurate number for the memory used by the Java heap in each loop iteration which is computed from [`mincore`](https://man7.org/linux/man-pages/man2/mincore.2.html) (this includes `ZERO` pages) and from [`/proc/self/pagemap`](https://www.kernel.org/doc/Documentation/vm/pagemap.txt) (where we only count the occupied, physical pages).
-
-```terminal
-$ LOG=TRACE java -Xmx1g -Xms1g -XX:+AlwaysPreTouch -XX:+UseG1GC \
-                 -DballoonSize=209715200 \
-                 -cp jballoon-1.0-SNAPSHOT-tests.jar:jballoon-1.0-SNAPSHOT.jar \
-                 io.simonis.jballoon.test.HumongousFragmentationTest
-```
-
-With a 1gb heap and 200mb balloon, this will print the following output:
-
-```terminal
-HumongousFragmentationTest -> (reserved/mincore/RSS) = (1048576kb / 1048576kb / 1048576kb)
-...
-JBalloon::inflate(209715200)
-JBalloon::inflateNative_impl() -> (reserved/mincore/RSS) = (1048576kb / 1048576kb / 1048576kb)
-JBalloon::inflateNative_impl() -> madvise(0xed201000, 210759680)
-JBalloon::inflateNative_impl() -> (reserved/mincore/RSS) = (1048576kb / 842756kb / 842756kb)
-JBalloon::inflateNative_impl() -> created balloon at 0xed200000.
-JBalloon::inflate(209715200) -> Balloon(210763776, 210759680)
-...
-HumongousFragmentationTest -> (reserved/mincore/RSS) = (1048576kb / 842756kb / 842756kb)
-...
-JBalloon::move_if_jBalloon() -> (reserved/mincore/RSS) = (1048576kb / 842756kb / 842756kb)
-JBalloon::move_if_jBalloon() -> madvise(0xe8b01000, 210759680)
-JBalloon::move_if_jBalloon() -> (reserved/mincore/RSS) = (1048576kb / 770052kb / 770052kb)
-...
-JBalloon::move_if_jBalloon() -> (reserved/mincore/RSS) = (1048576kb / 841408kb / 841408kb)
-JBalloon::move_if_jBalloon() -> madvise(0xe6401000, 210759680)
-JBalloon::move_if_jBalloon() -> (reserved/mincore/RSS) = (1048576kb / 801472kb / 801472kb)
-...
-JBalloon::move_if_jBalloon() -> (reserved/mincore/RSS) = (1048576kb / 841740kb / 841740kb)
-JBalloon::move_if_jBalloon() -> madvise(0xdfb01000, 210759680)
-JBalloon::move_if_jBalloon() -> (reserved/mincore/RSS) = (1048576kb / 734220kb / 734220kb)
-...
-HumongousFragmentationTest -> (reserved/mincore/RSS) = (1048576kb / 841740kb / 841740kb)
-JBalloon::deflate(Balloon(210763776, 210759680))
-JBalloon::deflateNative() -> removed balloon at 0xc0300000
-JBalloon::deflate(Balloon(deflated)) -> long[26345472]
-...
-HumongousFragmentationTest -> (reserved/mincore/RSS) = (1048576kb / 841740kb / 841740kb)
-HumongousFragmentationTest -> (reserved/mincore/RSS) = (1048576kb / 891484kb / 891484kb)
-HumongousFragmentationTest -> (reserved/mincore/RSS) = (1048576kb / 909480kb / 909480kb)
-HumongousFragmentationTest -> (reserved/mincore/RSS) = (1048576kb / 973788kb / 973788kb)
-...
-HumongousFragmentationTest -> (reserved/mincore/RSS) = (1048576kb / 1047636kb / 1047636kb)
-```
-
-Initially, the heap occupies 1048576kb (i.e. 1gb) (because we used `-XX:+AlwaysPreTouch` to simulate the worst case). Once the balloon is inflated, RSS drops by roughly 200mb to 843784kb. Notice, how subsequently the `mincore()` numbers increase because some of the balloon pages are touched (i.e. read) by GC, but RSS remains at ~840mb.
-
-Once the balloon is deflated, the RSS quickly increases back to 1048576kb. Notice that with `LOG=TRACE`, this test can run for a very long time. To shorten the runtime, you can e.g. decrease the balloon size to 32mb.
+We first run the test with the `DEBUG` logging level:
 
 ```terminal
 $ LOG=DEBUG java -Xmx1g -Xms1g -XX:+AlwaysPreTouch -XX:+UseG1GC \
                  -DballoonSize=209715200 \
+                 -Dio.simonis.jballoon.logLevel=fine \
                  -cp jballoon-1.0-SNAPSHOT-tests.jar:jballoon-1.0-SNAPSHOT.jar \
-                 io.simonis.jballoon.test.HumongousFragmentationTest \
-                 2>&1 | grep "moves to"
-balloon at 0xed200000 moves to 0xe8b00000 with 135258112 bytes of overlap
-balloon at 0xe8b00000 moves to 0xe6400000 with 168812544 bytes of overlap
-balloon at 0xe6400000 moves to 0xe0400000 with 109043712 bytes of overlap
-balloon at 0xe0400000 moves to 0xda300000 with 107995136 bytes of overlap
-balloon at 0xda300000 moves to 0xd3800000 with 97509376 bytes of overlap
-balloon at 0xd3800000 moves to 0xd2300000 with 187686912 bytes of overlap
-...
-balloon at 0xc2300000 moves to 0xc1200000 with 191881216 bytes of overlap
-balloon at 0xc1200000 moves to 0xc0300000 with 193978368 bytes of overlap
+                 io.simonis.jballoon.test.HumongousFragmentationTest
 ```
 
-As you can see, the 200mb balloon is moved quite a few times during the execution and a lot of times a significant part of the array at the old and new location overlap, which makes it necessary to trap a lot of page faults in the overlap region. But notice that this is an extreme case that is intentionally triggered by this test case. In normal operation, humongous object are hardly ever moved by  the GC.
+With a 1gb heap and 200mb balloon, running on a supported platform with a supported JDK, this will print the following output:
 
-## Internals
+```terminal
+...
+JBalloon::inflate(209715200)                                                   (1)
+JBalloon::inflateNative_impl() -> madvise(0xed301000, 210759680)               (2)
+JBalloon::inflateNative_impl() -> created balloon at 0xed300000.               (3) 
+JBalloon::inflate(209715200) -> Balloon(210763776, 210759680)                  (4)
+JBalloon::move_if_jBalloon() -> moving balloon from 0xed300000 to 0xe8b00000   (5)
+JBalloon::move_if_jBalloon() -> madvise(0xe8b01000, 210759680)                 (6)
+JBalloon::move_if_jBalloon() -> moving balloon from 0xe8b00000 to 0xe6400000
+JBalloon::move_if_jBalloon() -> madvise(0xe6401000, 210759680)
+...
+JBalloon::move_if_jBalloon() -> moving balloon from 0xc0600000 to 0xc0300000   (7)
+JBalloon::move_if_jBalloon() -> madvise(0xc0301000, 210759680)                 
+JBalloon::deflate(Balloon(210763776, 210759680))                               (8) 
+JBalloon::deflateNative() -> removed balloon at 0xc0300000                     (9)
+JBalloon::deflate(Balloon(deflated)) -> long[26345472]                         (10)   
+```
+
+I've omitted the first part of the `DEBUG` log for now. That part will be discussed in the [Implementation Details](#implementation-details) section. The following list describes the log lines above in more detail:
+
+1. `Balloon::inflate()` was called with a `size` of `209715200` bytes.
+2. The native implementation of `JBalloon` madvises `210759680` bytes (corresponds to `51455` `4k` pages) starting at address `0xed301000` as `MADV_DONTNEED`. This basically returns `51455` system pages back to the OS.
+3. The `long[]` which backs up the balloon actually starts at `0xed301000` but we can't madvise the very first bytes, because that would overwrite the object header, so we started to madvise in the second page used by the array (i.e. `0xed301000`).
+4. The native implementation returned a `Balloon` object which is backed by a `long[26345472]` array (i.e. `210763776 / 8 = 26345472`) of which `210759680` bytes have been inflated (i.e. returned to the OS).
+5. When the GC moves our balloon array, the native part of `JBalloon` realizes this ..
+6. ..and immediately madvises the array at the new location. Notice how G1 GC compacts humongous objects towards lower heap addresses. 
+7. This goes on for a while, until our balloon array almost reaches the beginning of the heap (which in this example starts at `0xc0000000`).
+8. When the test finally calls `JBalloon::deflate()` on our balloon..
+9. ..the native implementation will unregister the backing `long[]` array at address `0xc0300000` from its records..
+10. ..and return it as return value of the `JBalloon::deflate()` call. Notice that the returned array has the same size like the array created in step 4. It is actually the *same* array.
+
+In order to see the actual effect of a balloon inflation on the memory occupancy of the Java heap, we have to run with the highest logging level `TRACE`. Notice that this will considerably increase the run time of the test, because a this logging level the test will print an accurate number for the memory used by the Java heap in each loop iteration which is computed from [`mincore`](https://man7.org/linux/man-pages/man2/mincore.2.html) (this includes `ZERO` pages) as well as from [`/proc/self/pagemap`](https://www.kernel.org/doc/Documentation/vm/pagemap.txt) (where we only count the occupied, physical pages).
+
+So with the `TRACE` log level, we will get the following output:
+
+```terminal
+HumongousFragmentationTest -> (reserved/mincore/RSS) = (1048576kb / 1048576kb / 1048560kb)     (1)
+...
+JBalloon::inflateNative_impl() -> madvise(0xed301000, 210759680)
+JBalloon::inflateNative_impl() -> (reserved/mincore/RSS) = (1048576kb / 842756kb / 842756kb)   (2)
+...
+HumongousFragmentationTest -> (reserved/mincore/RSS) = (1048576kb / 842756kb / 842756kb)
+HumongousFragmentationTest -> (reserved/mincore/RSS) = (1048576kb / 842756kb / 842756kb)
+...
+HumongousFragmentationTest -> (reserved/mincore/RSS) = (1048576kb / 842756kb / 842756kb)9
+JBalloon::move_if_jBalloon() -> moving balloon from 0xed300000 to 0xe8b00000                   (3)
+JBalloon::move_if_jBalloon() -> madvise(0xe8b01000, 210759680)
+JBalloon::move_if_jBalloon() -> (reserved/mincore/RSS) = (1048576kb / 769028kb / 769028kb)     (4)
+HumongousFragmentationTest -> (reserved/mincore/RSS) = (1048576kb / 841404kb / 841404kb)
+...
+JBalloon::move_if_jBalloon() -> moving balloon from 0xc0500000 to 0xc0300000
+JBalloon::move_if_jBalloon() -> (reserved/mincore/RSS) = (1048576kb / 841736kb / 841736kb)
+JBalloon::move_if_jBalloon() -> madvise(0xc0301000, 210759680)
+JBalloon::move_if_jBalloon() -> (reserved/mincore/RSS) = (1048576kb / 839688kb / 839684kb)     (5)
+...
+JBalloon::deflate(Balloon(210763776, 210759680))                                               (6)
+JBalloon::deflateNative() -> removed balloon at 0xc0300000
+JBalloon::deflate(Balloon(deflated)) -> long[26345472]
+HumongousFragmentationTest -> (reserved/mincore/RSS) = (1048576kb / 841736kb / 841736kb)
+HumongousFragmentationTest -> (reserved/mincore/RSS) = (1048576kb / 891480kb / 891480kb)
+HumongousFragmentationTest -> (reserved/mincore/RSS) = (1048576kb / 909476kb / 909476kb)
+HumongousFragmentationTest -> (reserved/mincore/RSS) = (1048576kb / 973784kb / 973784kb)
+HumongousFragmentationTest -> (reserved/mincore/RSS) = (1048576kb / 992500kb / 992500kb)
+HumongousFragmentationTest -> (reserved/mincore/RSS) = (1048576kb / 1029900kb / 1029900kb)
+HumongousFragmentationTest -> (reserved/mincore/RSS) = (1048576kb / 1043060kb / 1043060kb)
+HumongousFragmentationTest -> (reserved/mincore/RSS) = (1048576kb / 1043060kb / 1043060kb)
+HumongousFragmentationTest -> (reserved/mincore/RSS) = (1048576kb / 1043060kb / 1043060kb)     (7)
+
+```
+
+Initially (1), the heap occupies 1048576kb (i.e. 1gb) (because we used `-XX:+AlwaysPreTouch` to simulate the worst case). Once the balloon is inflated (2), RSS drops by roughly `200mb` to `842756kb`. The memory consumption of the heap remains at `842756kb`, no difference how many allocations our test program is doing and how many GC will run (this can be verified by additionally enabling the GC log with `-Xlog:gc`).
+
+When the balloon array is moved by the GC (3), the memory consumption temporarily drops even further down to `769028kb` (4) because `JBalloon` madvises the balloon at the new location while the old madvised region hasn't been fully touched by the GC yet (and thus pages haven't been completely paged in again). But notice how this temporary drop get smaller and smaller (5) as the source and destination locations of the array do overlap more and more the more to array is moved to the beginning of the heap.
+
+Finally, once we deflate the balloon (6), the memory consumption slowly gets back to the initial `1048576kb` as the previously madvised pages get paged in again either because GC moves other objects into those regions previously occupied by the balloon array or because the application can allocate in these regions because they are now free from the point of view of the GC (if the deflated backing array isn't kept alive by the application).
+## Implementation Details
 
 TBD
+
+<!--
+JBalloon::nativeInit() -> page size: 4096, region size: 1048576, object header size: 12
+JBalloon::nativeInit() -> long array offset in object: 16
+JBalloon::nativeInit() -> heap base: 0xc0000000, heap size: 1073741824
+JBalloon::can_use_compact_humongous_obj_patching() -> located 'SerialHeap::SerialHeap()' at 0x7ffff72daca0 (size = 240)
+JBalloon::can_use_compact_humongous_obj_patching() -> located 'G1FullGCCompactTask::compact_humongous_obj(HeapRegion*)' at 0x7ffff6ccd0f0
+JBalloon::can_use_compact_humongous_obj_patching() -> size of 'G1FullGCCompactTask::compact_humongous_obj(HeapRegion*)' is 613
+JBalloon::can_use_compact_humongous_obj_patching() -> located 'G1FullGCCompactTask::copy_object_to_new_location(oop obj)' at 0x7ffff6ccc6d0
+JBalloon::can_use_compact_humongous_obj_patching() -> size of 'G1FullGCCompactTask::copy_object_to_new_location(oop obj)' is 441
+JBalloon::can_use_compact_humongous_obj_patching() -> 'G1FullGCCompactTask::compact_humongous_obj()' calls 'copy_object_to_new_location()' at 0x7ffff6ccd206
+JBalloon::patch_call_instr() -> found call to 'memmove()' at 0x7ffff6ccc779
+JBalloon::patch_call_instr() -> call to 'memmove()' can be patched directly
+-->
 
 ## Alternatives
 
