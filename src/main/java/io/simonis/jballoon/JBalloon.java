@@ -177,9 +177,13 @@ public class JBalloon {
     }
 
     /**
-     * Initializes and returns the singleton {@code JBalloon} instance.
-     * 
-     * @return the {@code JBalloon} singleton instance.
+     * Initializes and returns the singleton {@code JBalloon} instance. If {@code JBalloon}
+     * can't be initialized, {@code null} will be returned. In such cases you can enable the
+     * {@code DEBUG} log level of {@code JBalloon}'s native library by setting the environment
+     * variable {@code LOG=DEBUG} to get more information about why the initialization failed.
+     *
+     * @return the {@code JBalloon} singleton instance or {@code null} if {@code JBalloon}
+     * can't be initialized.
      */
     public static JBalloon getInstance() {
         return jBalloon;

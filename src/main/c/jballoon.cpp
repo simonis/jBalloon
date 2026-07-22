@@ -591,79 +591,73 @@ static bool can_use_compact_humongous_obj_patching() {
   }
 #endif
   char* compact_humongous_obj_addr = (char*)find_local_symbol(libjvm_handle, compact_humongous_obj_name, &compact_humongous_obj_size);
-  if (compact_humongous_obj_addr != nullptr) {
-    log(INFO, "JBalloon::can_use_compact_humongous_obj_patching() -> located 'G1FullGCCompactTask::compact_humongous_obj(HeapRegion*)' at %p\n", compact_humongous_obj_addr);
-    if (compact_humongous_obj_size != 0) {
-      log(INFO, "JBalloon::can_use_compact_humongous_obj_patching() -> size of 'G1FullGCCompactTask::compact_humongous_obj(HeapRegion*)' is %d\n", compact_humongous_obj_size);
-      uintptr_t patch_addr = 0;
-      // Now try to find a call to 'memmove()'/'_Copy_conjoint_words()' in 'G1FullGCCompactTask::compact_humongous_obj()'
-      for (char* start = compact_humongous_obj_addr; start < compact_humongous_obj_addr + compact_humongous_obj_size; start += INSTR_INC) {
+  if (compact_humongous_obj_addr != nullptr && compact_humongous_obj_size != 0) {
+    log(INFO, "JBalloon::can_use_compact_humongous_obj_patching() -> located 'G1FullGCCompactTask::compact_humongous_obj(HeapRegion*)' at %p (size = %d)\n",
+              compact_humongous_obj_addr, compact_humongous_obj_size);
+    uintptr_t patch_addr = 0;
+    // Now try to find a call to 'memmove()'/'_Copy_conjoint_words()' in 'G1FullGCCompactTask::compact_humongous_obj()'
+    for (char* start = compact_humongous_obj_addr; start < compact_humongous_obj_addr + compact_humongous_obj_size; start += INSTR_INC) {
 #if defined(__x86_64)
-        if (verify_is_got_func_call(libjvm_handle, (uintptr_t)start, "memmove")) {
+      if (verify_is_got_func_call(libjvm_handle, (uintptr_t)start, "memmove")) {
 #elif defined(__aarch64__)
-        if (verify_is_func_call((uintptr_t)start, (void*)copy_conjoint_words_addr)) {
+      if (verify_is_func_call((uintptr_t)start, (void*)copy_conjoint_words_addr)) {
 #else
-        if (true) {
-          log(WARNING, "JBalloon::can_use_compact_humongous_obj_patching() -> compact_humongous_obj_patching() currently only implemented for x86_64 and aarch64\n");
-          return false;
+      if (true) {
+        log(WARNING, "JBalloon::can_use_compact_humongous_obj_patching() -> compact_humongous_obj_patching() currently only implemented for x86_64 and aarch64\n");
+        return false;
 #endif
-          patch_addr = (uintptr_t)start;
-          break;
-        }
+        patch_addr = (uintptr_t)start;
+        break;
       }
-      // If we didn't find the call to 'memmove()'/'_Copy_conjoint_words()' in 'G1FullGCCompactTask::compact_humongous_obj()'
-      // it can be that 'G1FullGCCompactTask::compact_humongous_obj()' didn't inline 'G1FullGCCompactTask::copy_object_to_new_location()'.
-      // So check if we can find a call to 'G1FullGCCompactTask::copy_object_to_new_location()' in
-      // 'G1FullGCCompactTask::compact_humongous_obj()' and if that's the case, look for the 'memmove()'/'_Copy_conjoint_words()'
-      // call in 'G1FullGCCompactTask::copy_object_to_new_location()'.
-      if (patch_addr == 0) {
-        size_t copy_object_to_new_location_size = 0;
-        char* copy_object_to_new_location_addr = (char*)find_local_symbol(libjvm_handle,
-                                                                          copy_object_to_new_location_name,
-                                                                          &copy_object_to_new_location_size);
-        if (copy_object_to_new_location_addr != nullptr && copy_object_to_new_location_size != 0) {
-          log(INFO, "JBalloon::can_use_compact_humongous_obj_patching() -> located 'G1FullGCCompactTask::copy_object_to_new_location(oop obj)' at %p\n", copy_object_to_new_location_addr);
-          log(INFO, "JBalloon::can_use_compact_humongous_obj_patching() -> size of 'G1FullGCCompactTask::copy_object_to_new_location(oop obj)' is %d\n", copy_object_to_new_location_size);
-          // Now try to find a call to 'G1FullGCCompactTask::copy_object_to_new_location()' in 'G1FullGCCompactTask::compact_humongous_obj()'.
-          for (char* start = compact_humongous_obj_addr; start < compact_humongous_obj_addr + compact_humongous_obj_size; start += INSTR_INC) {
-            if (verify_is_func_call((uintptr_t)start, copy_object_to_new_location_addr)) {
-              // 'G1FullGCCompactTask::compact_humongous_obj()' calls 'G1FullGCCompactTask::copy_object_to_new_location()' so we can find
-              // the call to 'memmove()'/'_Copy_conjoint_words()' in 'G1FullGCCompactTask::copy_object_to_new_location()' and patch it there.
-              log(INFO, "JBalloon::can_use_compact_humongous_obj_patching() -> 'G1FullGCCompactTask::compact_humongous_obj()' calls 'copy_object_to_new_location()' at %p\n", start);
+    }
+    // If we didn't find the call to 'memmove()'/'_Copy_conjoint_words()' in 'G1FullGCCompactTask::compact_humongous_obj()'
+    // it can be that 'G1FullGCCompactTask::compact_humongous_obj()' didn't inline 'G1FullGCCompactTask::copy_object_to_new_location()'.
+    // So check if we can find a call to 'G1FullGCCompactTask::copy_object_to_new_location()' in
+    // 'G1FullGCCompactTask::compact_humongous_obj()' and if that's the case, look for the 'memmove()'/'_Copy_conjoint_words()'
+    // call in 'G1FullGCCompactTask::copy_object_to_new_location()'.
+    if (patch_addr == 0) {
+      size_t copy_object_to_new_location_size = 0;
+      char* copy_object_to_new_location_addr = (char*)find_local_symbol(libjvm_handle,
+                                                                        copy_object_to_new_location_name,
+                                                                        &copy_object_to_new_location_size);
+      if (copy_object_to_new_location_addr != nullptr && copy_object_to_new_location_size != 0) {
+        log(INFO, "JBalloon::can_use_compact_humongous_obj_patching() -> located 'G1FullGCCompactTask::copy_object_to_new_location(oop obj)' at %p (size = %d)\n",
+                  copy_object_to_new_location_addr, copy_object_to_new_location_size);
+        // Now try to find a call to 'G1FullGCCompactTask::copy_object_to_new_location()' in 'G1FullGCCompactTask::compact_humongous_obj()'.
+        for (char* start = compact_humongous_obj_addr; start < compact_humongous_obj_addr + compact_humongous_obj_size; start += INSTR_INC) {
+          if (verify_is_func_call((uintptr_t)start, copy_object_to_new_location_addr)) {
+            // 'G1FullGCCompactTask::compact_humongous_obj()' calls 'G1FullGCCompactTask::copy_object_to_new_location()' so we can find
+            // the call to 'memmove()'/'_Copy_conjoint_words()' in 'G1FullGCCompactTask::copy_object_to_new_location()' and patch it there.
+            log(INFO, "JBalloon::can_use_compact_humongous_obj_patching() -> 'G1FullGCCompactTask::compact_humongous_obj()' calls 'copy_object_to_new_location()' at %p\n", start);
 
-              // Now try to find a call to 'memmove()'/'_Copy_conjoint_words()' in 'G1FullGCCompactTask::copy_object_to_new_location()'
-              for (char* s = copy_object_to_new_location_addr; s < copy_object_to_new_location_addr + copy_object_to_new_location_size; s += INSTR_INC) {
+            // Now try to find a call to 'memmove()'/'_Copy_conjoint_words()' in 'G1FullGCCompactTask::copy_object_to_new_location()'
+            for (char* s = copy_object_to_new_location_addr; s < copy_object_to_new_location_addr + copy_object_to_new_location_size; s += INSTR_INC) {
 #if defined(__x86_64)
-                if (verify_is_got_func_call(libjvm_handle, (uintptr_t)s, "memmove")) {
+              if (verify_is_got_func_call(libjvm_handle, (uintptr_t)s, "memmove")) {
 #elif defined(__aarch64__)
-                if (verify_is_func_call((uintptr_t)s, (void*)copy_conjoint_words_addr)) {
+              if (verify_is_func_call((uintptr_t)s, (void*)copy_conjoint_words_addr)) {
 #endif
-                  patch_addr = (uintptr_t)s;
-                  break;
-                }
+                patch_addr = (uintptr_t)s;
+                break;
               }
-              break;
             }
-          }
-        } else {
-          if (copy_object_to_new_location_addr != nullptr) {
-            log(ERROR, "JBalloon::can_use_compact_humongous_obj_patching() -> can't get address of 'G1FullGCCompactTask::copy_object_to_new_location(oop obj)' in libjvm.so (dlerror=%s)\n", dlerror());
-          } else {
-            log(ERROR, "JBalloon::can_use_compact_humongous_obj_patching() -> can't get size of 'G1FullGCCompactTask::copy_object_to_new_location(oop obj)' in libjvm.so (dlerror=%s)\n", dlerror());
+            break;
           }
         }
-      }
-      // If we found the call to 'memmove()'/'_Copy_conjoint_words()' patch it to call into our local 'jBalloon_memmove()' instead.
-      if (patch_addr != 0) {
-        return patch_call_instr(patch_addr, (uintptr_t)jBalloon_memmove, (uintptr_t)serialHeap_constr_addr);
       } else {
-        log(ERROR, "JBalloon::can_use_compact_humongous_obj_patching() ->cCan't find call to 'memmove()'/'_Copy_conjoint_words() (dlerror=%s)'\n", dlerror());
+        log(ERROR, "JBalloon::can_use_compact_humongous_obj_patching() -> can't get %s of 'G1FullGCCompactTask::copy_object_to_new_location(oop obj)' in libjvm.so (dlerror=%s)\n",
+                   (copy_object_to_new_location_addr == nullptr) ? "address" : "size",  dlerror());
       }
+    }
+    // If we found the call to 'memmove()'/'_Copy_conjoint_words()' patch it to call into our local 'jBalloon_memmove()' instead.
+    if (patch_addr != 0) {
+      return patch_call_instr(patch_addr, (uintptr_t)jBalloon_memmove, (uintptr_t)serialHeap_constr_addr);
     } else {
-      log(ERROR, "JBalloon::can_use_compact_humongous_obj_patching() -> can't get size of 'G1FullGCCompactTask::compact_humongous_obj(HeapRegion*)' in libjvm.so (dlerror=%s)\n", dlerror());
+      log(ERROR, "JBalloon::can_use_compact_humongous_obj_patching() ->cCan't find call to 'memmove()'/'_Copy_conjoint_words() (dlerror=%s)'\n", dlerror());
     }
   } else {
-    log(ERROR, "JBalloon::can_use_compact_humongous_obj_patching() -> can't get address of 'G1FullGCCompactTask::compact_humongous_obj(HeapRegion*)' in libjvm.so (dlerror=%s)\n", dlerror());
+    log(ERROR, "JBalloon::can_use_compact_humongous_obj_patching() -> can't get %s of 'G1FullGCCompactTask::compact_humongous_obj(HeapRegion*)' in libjvm.so (dlerror=%s)\n",
+               (compact_humongous_obj_addr == nullptr) ? "address" : "size", dlerror());
   }
   return false;
 }
@@ -801,11 +795,12 @@ JNIEXPORT jboolean JNICALL Java_io_simonis_jballoon_JBalloon_nativeInit(JNIEnv* 
 
   // Before JDK 21, G1 GC didn't move humongous objects at all, so there's no need for patching.
   // See: Last-ditch Full GC should also move humongous objects (https://bugs.openjdk.org/browse/JDK-8191565)
-  if (javaVersion < 21 || can_use_compact_humongous_obj_patching()) {
+  if (javaVersion < 21) {
+    log(INFO, "JBalloon::nativeInit() -> detected JDK version %d < 21, no patching required\n", javaVersion);
     return true;
   }
 
-  return false;
+  return can_use_compact_humongous_obj_patching();
 }
 
 

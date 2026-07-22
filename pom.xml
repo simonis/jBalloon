@@ -107,14 +107,6 @@
                                     <!-- Needed for the global new operator and requires the installation of 'libstdc++-static'. -->
                                     <arg value="-lsupc++"/>
                                 </exec>
-                                <exec executable="gcc" failonerror="true">
-                                    <arg value="${gcc.opt.level}"/>
-                                    <arg value="-shared"/>
-                                    <arg value="-fPIC"/>
-                                    <arg value="-o"/>
-                                    <arg value="${project.build.outputDirectory}/native/libsimplememmove.so"/>
-                                    <arg value="${project.basedir}/src/main/c/simplememmove.c"/>
-                                </exec>
                             </target>
                         </configuration>
                     </execution>
